@@ -1,0 +1,2771 @@
+"""Project Knowledge Agent: official docs."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+import re
+import sys
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PACKAGE_ROOT))
+
+try:
+    from core.models import SectionDocument, SectionFinding, Target
+except Exception:
+    from pydantic import BaseModel, Field
+
+    class Target(BaseModel):
+        id: int | None = None
+        name: str
+        ticker: str | None = None
+        category: str | None = None
+        coingecko_id: str | None = None
+        metadata: dict[str, Any] = Field(default_factory=dict)
+
+    class SectionFinding(BaseModel):
+        claim: str
+        category: str
+        confidence: float = 0.5
+        as_of: datetime | None = None
+        citations: list[str] = Field(default_factory=list)
+        source_type: str
+        source_name: str
+        metadata: dict[str, Any] = Field(default_factory=dict)
+
+    class SectionDocument(BaseModel):
+        section_id: str
+        title: str
+        summary: str | None = None
+        markdown: str = ""
+        structured_data: dict[str, Any] = Field(default_factory=dict)
+        findings: list[SectionFinding] = Field(default_factory=list)
+        citations: list[str] = Field(default_factory=list)
+        coverage: dict[str, Any] = Field(default_factory=dict)
+        status: str = "ok"
+        generated_at: datetime | None = None
+        metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # Pydantic v2 forward-reference fix: rebuild models with explicit type namespace
+    SectionFinding.model_rebuild(_types_namespace={"datetime": datetime, "Any": Any})
+    SectionDocument.model_rebuild(_types_namespace={"datetime": datetime, "Any": Any, "SectionFinding": SectionFinding})
+
+from project_knowledge_agent.config import Settings, get_settings
+from project_knowledge_agent.documentation_prompt import (
+    DOCUMENTATION_ANALYSIS_PROMPT,
+    DOCUMENTATION_ANALYSIS_PROMPT_VERSION,
+)
+from project_knowledge_agent.docs_stage import OfficialDocsStage
+from project_knowledge_agent.documentation_interpreter import (
+    DocsEvidenceBundle,
+    DocumentationInterpretation,
+    DocumentationInterpreter,
+    business_model_from_project_type,
+)
+from project_knowledge_agent.official_blog_stage import OfficialBlogStage
+class ProjectKnowledgeAgent:
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        docs_stage: OfficialDocsStage | None = None,
+        blog_stage=None,
+        client_factory=None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.docs_stage = docs_stage or OfficialDocsStage(self.settings)
+        self.blog_stage = blog_stage or OfficialBlogStage(self.settings)
+        self.client_factory = client_factory or (
+            lambda: httpx.AsyncClient(timeout=self.settings.http_timeout_seconds, follow_redirects=True)
+        )
+        self.interpreter = _new_documentation_interpreter()
+
+    def availability(self) -> tuple[bool, str]:
+        return True, "ok"
+
+    async def collect_project_knowledge(
+        self,
+        target: Target,
+        baseline_results: list,
+        period_days: int = 365,
+    ) -> SectionDocument:
+        del baseline_results
+        async with self.client_factory() as client:
+            docs_result = await self.docs_stage.collect(target, client=client, period_days=period_days)
+            blog_result = await self.blog_stage.collect(
+                target,
+                client=client,
+                docs_result=docs_result,
+                period_days=period_days,
+            )
+        interpretation = self.interpreter.interpret(docs_result.profile) if docs_result.profile is not None else None
+        findings = self._build_findings(docs_result=docs_result, blog_result=blog_result, interpretation=interpretation)
+        citations = self._collect_citations(
+            docs_result.citations,
+            findings=findings,
+            profile=docs_result.profile,
+        )
+        status = self._status(docs_status=docs_result.status, blog_status=blog_result.status, findings=findings)
+        structured_data = {
+            "period_days": period_days,
+            "documentation_analysis_spec": {
+                "version": DOCUMENTATION_ANALYSIS_PROMPT_VERSION,
+                "prompt": DOCUMENTATION_ANALYSIS_PROMPT,
+            },
+            "docs_profile": (
+                docs_result.profile.model_dump(mode="json")
+                if docs_result.profile is not None else {}
+            ),
+            "docs_evidence_bundle": (
+                {
+                    "official_urls": interpretation.evidence.official_urls,
+                    "docs_urls_read": interpretation.evidence.docs_urls_read,
+                    "read_stats": interpretation.evidence.read_stats,
+                    "evidence_by_topic": interpretation.evidence.evidence_by_topic,
+                    "source_presence_flags": interpretation.evidence.source_presence_flags,
+                    "compatibility_hints": interpretation.evidence.compatibility_hints,
+                }
+                if interpretation is not None else {}
+            ),
+            "official_blog": {
+                "posts": [
+                    _blog_post_to_payload(post)
+                    for post in (getattr(blog_result, "posts", []) or [])
+                ],
+                "citations": list(getattr(blog_result, "citations", []) or []),
+                "coverage": dict(getattr(blog_result, "coverage", {}) or {}),
+                "status": getattr(blog_result, "status", "partial"),
+            },
+        }
+        markdown = self._build_markdown(
+            target=target,
+            docs_result=docs_result,
+            blog_result=blog_result,
+            findings=findings,
+            citations=citations,
+            period_days=period_days,
+            interpretation=interpretation,
+        )
+        return SectionDocument(
+            section_id="project_knowledge",
+            title="Знание о проекте",
+            summary=self._build_summary(target=target, docs_result=docs_result, blog_result=blog_result, interpretation=interpretation),
+            markdown=markdown,
+            structured_data=structured_data,
+            findings=findings,
+            citations=citations,
+            coverage={
+                "docs": docs_result.coverage,
+                "official_blog": getattr(blog_result, "coverage", {}) or {},
+            },
+            status=status,
+            generated_at=datetime.now(timezone.utc),
+            metadata={
+                "agent": "project_knowledge_agent",
+                "period_days": period_days,
+                "documentation_analysis_prompt_version": DOCUMENTATION_ANALYSIS_PROMPT_VERSION,
+            },
+        )
+
+    def _build_findings(self, *, docs_result, blog_result, interpretation: DocumentationInterpretation | None = None) -> list[SectionFinding]:
+        findings: list[SectionFinding] = []
+        profile = docs_result.profile
+        if profile is not None:
+            docs_url = _preferred_docs_url(profile)
+            overview = interpretation.overview if interpretation is not None else _clean_doc_claim(profile.what_the_project_does, kind="overview")
+            if overview:
+                findings.append(
+                    self._finding(
+                        claim=overview,
+                        category="project_overview",
+                        citations=[docs_url] if docs_url else [],
+                        source_name="official_docs",
+                        confidence=max(profile.confidence or 0.0, 0.7),
+                    )
+                )
+            business_model = interpretation.business_model if interpretation is not None else _business_model_claim(profile)
+            if business_model:
+                findings.append(
+                    self._finding(
+                        claim=business_model,
+                        category="business_model",
+                        citations=[docs_url] if docs_url else [],
+                        source_name="official_docs",
+                    )
+                )
+            revenue_model = interpretation.revenue_model if interpretation is not None else _effective_revenue_model_claim(profile)
+            if revenue_model:
+                findings.append(
+                    self._finding(
+                        claim=revenue_model,
+                        category="revenue_model",
+                        citations=[docs_url] if docs_url else [],
+                        source_name="official_docs",
+                    )
+                )
+            token_role = interpretation.token_role if interpretation is not None else _clean_doc_claim(profile.token_role, kind="token_role")
+            if token_role:
+                token_url = _first_profile_url(
+                    profile,
+                    profile.official_urls.get("tokenomics") or profile.official_urls.get("docs") or profile.docs_urls_read,
+                )
+                findings.append(
+                    self._finding(
+                        claim=token_role,
+                        category="token_role",
+                        citations=[token_url] if token_url else [],
+                        source_name="official_docs",
+                    )
+                )
+            entities = _key_entities_claim(profile)
+            if entities:
+                findings.append(
+                    self._finding(
+                        claim=entities,
+                        category="product_entities",
+                        citations=[docs_url] if docs_url else [],
+                        source_name="official_docs",
+                    )
+                )
+            token_utility_claim = _token_utility_claim(profile, interpretation=interpretation)
+            if token_utility_claim:
+                findings.append(
+                    self._finding(
+                        claim=token_utility_claim,
+                        category="token_utility",
+                        citations=[_first_profile_url(profile, profile.official_urls.get("tokenomics") or profile.docs_urls_read)]
+                        if _first_profile_url(profile, profile.official_urls.get("tokenomics") or profile.docs_urls_read)
+                        else [],
+                        source_name="official_docs",
+                        confidence=0.72,
+                    )
+                )
+            audit_detail_claim = _audit_detail_claim(profile)
+            if audit_detail_claim:
+                findings.append(
+                    self._finding(
+                        claim=audit_detail_claim,
+                        category="security",
+                        citations=[_first_profile_url(profile, profile.official_urls.get("audits") or profile.official_urls.get("security"))]
+                        if _first_profile_url(profile, profile.official_urls.get("audits") or profile.official_urls.get("security"))
+                        else [],
+                        source_name="official_docs",
+                        confidence=0.74,
+                    )
+                )
+            for security_claim in _security_highlight_claims(profile)[:2]:
+                findings.append(
+                    self._finding(
+                        claim=security_claim["claim"],
+                        category="security",
+                        citations=[security_claim["url"]] if security_claim.get("url") else [],
+                        source_name="official_docs",
+                        confidence=0.7,
+                    )
+                )
+            for risk in (profile.risk_factors or [])[:3]:
+                cleaned_risk = _clean_doc_claim(risk, kind="risk")
+                if not cleaned_risk:
+                    continue
+                risk_url = _first_profile_url(profile, profile.official_urls.get("security") or profile.docs_urls_read)
+                findings.append(
+                    self._finding(
+                        claim=cleaned_risk,
+                        category="risk",
+                        citations=[risk_url] if risk_url else [],
+                        source_name="official_docs",
+                        confidence=0.72,
+                    )
+                )
+            capability_claim = _capability_flags_claim(profile)
+            if capability_claim:
+                findings.append(
+                    self._finding(
+                        claim=capability_claim,
+                        category="protocol_capabilities",
+                        citations=[docs_url] if docs_url else [],
+                        source_name="official_docs",
+                        confidence=0.7,
+                    )
+                )
+            for snippet in _evidence_claims(profile)[:4]:
+                findings.append(
+                    self._finding(
+                        claim=snippet["claim"],
+                        category="docs_evidence",
+                        citations=[snippet.get("url") or docs_url] if (snippet.get("url") or docs_url) else [],
+                        source_name="official_docs",
+                        confidence=0.66,
+                    )
+                )
+            if profile.audits_present:
+                audit_url = _first_profile_url(profile, profile.official_urls.get("audits"))
+                findings.append(
+                    self._finding(
+                        claim="Официальная документация содержит упоминание завершённых аудитов безопасности.",
+                        category="security",
+                        citations=[audit_url] if audit_url else [],
+                        source_name="official_docs",
+                    )
+                )
+        return _dedupe_findings(findings)
+
+    def _build_summary(self, *, target: Target, docs_result, blog_result, interpretation: DocumentationInterpretation | None = None) -> str:
+        parts: list[str] = []
+        if docs_result.profile:
+            overview = interpretation.overview if interpretation is not None else _clean_doc_claim(docs_result.profile.what_the_project_does, kind="overview")
+            if overview:
+                parts.append(overview)
+            else:
+                fallback_summary = _clean_doc_claim(getattr(docs_result, "summary", None), kind="overview")
+                if fallback_summary:
+                    parts.append(fallback_summary)
+        return " ".join(parts).strip()
+
+    def _build_markdown(
+        self,
+        *,
+        target: Target,
+        docs_result,
+        blog_result,
+        findings: list[SectionFinding],
+        citations: list[str],
+        period_days: int,
+        interpretation: DocumentationInterpretation | None = None,
+    ) -> str:
+        lines = [f"## Знание о проекте: {target.name}", ""]
+        profile = docs_result.profile
+        official_sources = _main_official_sources_reviewed(profile, citations)
+        docs_quality = _coverage_quality(docs_result=docs_result, blog_result=blog_result)
+        missing_notes = _missing_documentation_notes(profile, docs_result=docs_result, blog_result=blog_result, interpretation=interpretation)
+        metadata_items = [
+            f"Project: {target.name}{f' ({target.ticker})' if target.ticker else ''}.",
+            (
+                f"Main official sources reviewed: {', '.join(official_sources[:8])}."
+                if official_sources else
+                "Main official sources reviewed: не удалось подтвердить список официальных источников."
+            ),
+            f"Coverage quality: {docs_quality}.",
+            (
+                f"Notes on missing documentation: {missing_notes}"
+                if missing_notes else
+                "Notes on missing documentation: явных пробелов в покрытии не зафиксировано, но часть тем может быть раскрыта неполно."
+            ),
+        ]
+        _append_section(lines, "1. Metadata", metadata_items)
+
+        if profile is not None:
+            _append_section(
+                lines,
+                "2. Project Overview",
+                _project_overview_items(profile, docs_result=docs_result, interpretation=interpretation),
+                fallback="Явного и достаточно подробного описания назначения проекта в официальной документации извлечь не удалось.",
+            )
+            _append_section(
+                lines,
+                "3. Product Mechanics",
+                _product_mechanics_items(profile),
+                fallback="Официальная документация не дала достаточно конкретики по механике продукта без риска галлюцинаций.",
+            )
+            _append_section(
+                lines,
+                "4. Token Utility",
+                _token_utility_items(profile, interpretation=interpretation),
+                fallback="По изученной документации не удалось уверенно извлечь содержательные тезисы о utility токена.",
+            )
+            _append_section(
+                lines,
+                "5. Value Capture",
+                _value_capture_items(profile, interpretation=interpretation),
+                fallback="Явная схема value capture для токена в изученной документации не прослеживается.",
+            )
+            _append_section(
+                lines,
+                "6. Tokenomics",
+                _tokenomics_items(profile, interpretation=interpretation),
+                fallback="В текущем проходе не извлечены конкретные данные по supply, vesting, unlocks и emissions.",
+            )
+            _append_section(
+                lines,
+                "7. Token Distribution",
+                _token_distribution_items(profile),
+                fallback="В изученной документации не найдены явные детали по распределению токенов между командой, инвесторами, казначейством и экосистемой.",
+            )
+            _append_section(
+                lines,
+                "8. Revenue Model",
+                _revenue_model_items(profile, interpretation=interpretation),
+                fallback="В изученной документации не нашлось достаточно конкретного описания устойчивой модели выручки.",
+            )
+            _append_section(
+                lines,
+                "9. Demand Drivers",
+                _demand_driver_items(profile, interpretation=interpretation),
+                fallback="Документация не дала достаточно конкретных тезисов о драйверах спроса на продукт и токен.",
+            )
+            _append_section(
+                lines,
+                "10. Team",
+                _team_items(profile, interpretation=interpretation),
+                fallback="В изученной документации не найдено надёжных данных о команде, основателях или советниках.",
+            )
+            _append_section(
+                lines,
+                "11. Investors and Partners",
+                _investors_and_partners_items(profile, [], interpretation=interpretation),
+                fallback="В изученной документации не удалось извлечь подтверждённый список инвесторов и содержательных партнёрств.",
+            )
+            _append_section(
+                lines,
+                "12. Security",
+                _security_items(profile),
+                fallback="Содержательных деталей по безопасности, охвату аудитов или bug bounty в изученной документации найдено мало.",
+            )
+            _append_section(
+                lines,
+                "13. Governance",
+                _governance_items(profile, interpretation=interpretation),
+                fallback="В изученной документации нет достаточно конкретного описания governance-механики.",
+            )
+            _append_section(
+                lines,
+                "14. Treasury",
+                _treasury_items(profile, interpretation=interpretation),
+                fallback="В изученной документации нет явных деталей о казначействе, его составе и правилах управления.",
+            )
+            _append_section(
+                lines,
+                "15. Roadmap",
+                _roadmap_items(profile, [], interpretation=interpretation),
+                fallback="В изученной документации не найдена чёткая дорожная карта с приоритетами и сроками.",
+            )
+            _append_section(
+                lines,
+                "16. Risks Mentioned by Project",
+                _risk_items(profile),
+                fallback="Явные признанные проектом риски и ограничения в текущем проходе извлечены слабо.",
+            )
+            _append_section(
+                lines,
+                "17. Red Flags",
+                _red_flag_items(profile, interpretation=interpretation),
+                fallback="Критичных красных флагов по изученной документации автоматически не зафиксировано, но это не заменяет ручную проверку.",
+            )
+            _append_final_verdict_section(
+                lines,
+                target=target,
+                profile=profile,
+                interpretation=interpretation,
+            )
+        else:
+            for title in (
+                "2. Project Overview",
+                "3. Product Mechanics",
+                "4. Token Utility",
+                "5. Value Capture",
+                "6. Tokenomics",
+                "7. Token Distribution",
+                "8. Revenue Model",
+                "9. Demand Drivers",
+                "10. Team",
+                "11. Investors and Partners",
+                "12. Security",
+                "13. Governance",
+                "14. Treasury",
+                "15. Roadmap",
+                "16. Risks Mentioned by Project",
+                "17. Red Flags",
+                "18. Final Documentation Verdict",
+            ):
+                _append_section(lines, title, [], fallback="Данные не извлечены: official documentation stage не вернул профиль проекта.")
+
+        if citations:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append("### Источники")
+            for url in citations[:20]:
+                lines.append(f"- {url}")
+        return "\n".join(lines).strip()
+
+    def _collect_citations(self, *groups, findings: list[SectionFinding], profile=None) -> list[str]:
+        urls: list[str] = []
+        allowed_roots = _trusted_project_root_domains(profile) if profile is not None else None
+        for group in groups:
+            for url in group:
+                for normalized in _normalize_source_urls(url):
+                    if normalized and _is_allowed_source_url(normalized, allowed_roots=allowed_roots) and normalized not in urls:
+                        urls.append(normalized)
+        for finding in findings:
+            for url in finding.citations:
+                for normalized in _normalize_source_urls(url):
+                    if normalized and _is_allowed_source_url(normalized, allowed_roots=allowed_roots) and normalized not in urls:
+                        urls.append(normalized)
+        return urls
+
+    def _status(self, docs_status: str, blog_status: str, findings: list[SectionFinding]) -> str:
+        del blog_status
+        if findings and docs_status == "ok":
+            return "ok"
+        if findings:
+            return "partial"
+        return "error"
+
+    def _finding(
+        self,
+        *,
+        claim: str,
+        category: str,
+        citations: list[str],
+        source_name: str,
+        source_type: str = "official_docs",
+        as_of: datetime | None = None,
+        confidence: float = 0.75,
+        metadata: dict[str, Any] | None = None,
+    ) -> SectionFinding:
+        return SectionFinding(
+            claim=claim[:500],
+            category=category,
+            confidence=confidence,
+            as_of=as_of,
+            citations=[url for url in citations if url],
+            source_type=source_type,
+            source_name=source_name,
+            metadata=metadata or {},
+        )
+
+
+def _append_section(lines: list[str], title: str, items: list[str], *, fallback: str = "Данные не извлечены.") -> None:
+    lines.append(f"### {title}")
+    if items:
+        for item in items:
+            lines.append(f"- {item}")
+    else:
+        lines.append(f"- {fallback}")
+    lines.append("")
+
+
+def _empty_blog_result(*, period_days: int):
+    return type(
+        "OfficialBlogResult",
+        (),
+        {
+            "posts": [],
+            "citations": [],
+            "status": "ok",
+            "coverage": {"available": False, "period_days": period_days, "posts_kept": 0},
+        },
+    )()
+
+
+def _blog_post_to_payload(post) -> dict[str, Any]:
+    published_at = getattr(post, "published_at", None)
+    return {
+        "url": getattr(post, "url", ""),
+        "title": getattr(post, "title", ""),
+        "published_at": published_at.isoformat() if published_at else None,
+        "summary": getattr(post, "summary", ""),
+        "key_points": list(getattr(post, "key_points", []) or []),
+        "categories": list(getattr(post, "categories", []) or []),
+        "source_name": getattr(post, "source_name", "official_blog"),
+        "source_type": getattr(post, "source_type", "official_blog"),
+    }
+
+
+def _new_documentation_interpreter() -> DocumentationInterpreter:
+    return DocumentationInterpreter(
+        clean_doc_claim=lambda value, kind: _clean_doc_claim(value, kind=kind),
+        trim_token_utility_noise=_trim_token_utility_noise,
+        looks_like_docs_shell=_looks_like_docs_shell,
+        dedupe_text_items=_dedupe_text_items,
+    )
+
+
+def _append_final_verdict_section(
+    lines: list[str],
+    *,
+    target: Target,
+    profile,
+    interpretation: DocumentationInterpretation | None = None,
+) -> None:
+    overview = interpretation.overview if interpretation is not None else _clean_doc_claim(getattr(profile, "what_the_project_does", None), kind="overview")
+    token_utility_claims = _token_utility_claims(profile, interpretation=interpretation)
+    product_token_link_claims = [
+        _clean_doc_claim(str(item), kind="fact")
+        for item in (getattr(profile, "product_token_link_points", []) or [])
+    ]
+    if interpretation is not None:
+        product_token_link_claims = interpretation.product_token_link_claims
+    product_token_link_claims = [item for item in product_token_link_claims if item]
+    business_model = _business_model_claim(profile, interpretation=interpretation)
+    revenue_model = _effective_revenue_model_claim(profile, interpretation=interpretation)
+    strengths = _documentation_strengths(profile, interpretation=interpretation)
+    weaknesses = _documentation_weaknesses(profile, interpretation=interpretation)
+    missing = _critical_docs_gaps(profile, interpretation=interpretation)
+    token_needed = "да" if (interpretation.token_needed if interpretation is not None else _token_looks_needed(profile, interpretation=interpretation)) else "неочевидно"
+    token_link = (
+        "связь между продуктом и токеном прослеживается"
+        if (token_utility_claims or product_token_link_claims)
+        else "связь между продуктом и токеном по docs выглядит слабой"
+    )
+    business_clarity = "да" if (business_model or revenue_model) else "нет"
+    summary = _final_project_summary(target=target, profile=profile, overview=overview, business_model=business_model)
+
+    lines.append("### 18. Final Documentation Verdict")
+    lines.append(f"- Что это за проект: {summary}")
+    lines.append(f"- Нужен ли токен по документации: {token_needed}.")
+    lines.append(f"- Есть ли понятная связь между продуктом и токеном: {token_link}.")
+    lines.append(f"- Выглядит ли бизнес-модель понятной: {business_clarity}.")
+    lines.append(f"- 3 главных сильных стороны: {', '.join(strengths[:3])}.")
+    lines.append(f"- 3 главных слабых места: {', '.join(weaknesses[:3])}.")
+    lines.append(f"- Чего критически не хватает в документации: {missing}.")
+    lines.append("")
+
+
+def _main_official_sources_reviewed(profile, citations: list[str]) -> list[str]:
+    urls: list[str] = []
+    allowed_roots = _trusted_project_root_domains(profile) if profile is not None else None
+    if profile is not None:
+        for key in ("website", "docs", "overview", "product", "tokenomics", "governance", "treasury", "team", "partners", "roadmap", "security", "audits", "faq"):
+            for url in (getattr(profile, "official_urls", {}) or {}).get(key) or []:
+                for normalized in _normalize_source_urls(url):
+                    if normalized and normalized not in urls and _is_allowed_source_url(normalized, allowed_roots=allowed_roots):
+                        urls.append(normalized)
+        for url in getattr(profile, "docs_urls_read", []) or []:
+            for normalized in _normalize_source_urls(url):
+                if normalized and normalized not in urls and _is_allowed_source_url(normalized, allowed_roots=allowed_roots):
+                    urls.append(normalized)
+    for url in citations:
+        for normalized in _normalize_source_urls(url):
+            if normalized and normalized not in urls and _is_allowed_source_url(normalized, allowed_roots=allowed_roots):
+                urls.append(normalized)
+    return urls[:12]
+
+
+def _coverage_quality(*, docs_result, blog_result) -> str:
+    docs_pages = int((docs_result.coverage or {}).get("pages_read") or 0)
+    docs_urls = int((docs_result.coverage or {}).get("docs_urls_read") or 0)
+    score = 0
+    if docs_pages >= 6:
+        score += 2
+    elif docs_pages >= 2:
+        score += 1
+    if docs_urls >= 2:
+        score += 1
+    if score >= 3:
+        return "high"
+    if score >= 2:
+        return "medium"
+    return "low"
+
+
+def _missing_documentation_notes(
+    profile,
+    *,
+    docs_result,
+    blog_result,
+    interpretation: DocumentationInterpretation | None = None,
+) -> str:
+    notes: list[str] = []
+    if profile is None:
+        return "профиль официальной документации не был извлечён."
+    if not getattr(profile, "token_utility_points", None):
+        notes.append("по token utility извлечено мало конкретики")
+    if not _effective_revenue_model_claim(profile, interpretation=interpretation):
+        notes.append("нет явного описания модели выручки")
+    if not getattr(profile, "audit_providers", None) and not getattr(profile, "audits_present", None):
+        notes.append("нет конкретных деталей по audits")
+    if not getattr(profile, "risk_factors", None):
+        notes.append("риски проекта раскрыты слабо")
+    return "; ".join(notes) if notes else ""
+
+
+def _project_overview_items(profile, *, docs_result, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    docs_url = _preferred_docs_url(profile)
+    raw_claims = list(
+        interpretation.project_overview_section_claims
+        if interpretation is not None
+        else _project_overview_fallback_claims(profile, docs_result=docs_result)
+    )
+    if interpretation is not None and not any(
+        claim == interpretation.overview or claim == _project_classification_claim(profile)
+        for claim in raw_claims
+    ):
+        fallback_summary = _clean_doc_claim(getattr(docs_result, "summary", None), kind="overview")
+        if fallback_summary:
+            raw_claims.insert(0, fallback_summary)
+        classification = _project_classification_claim(profile)
+        if classification:
+            raw_claims.append(classification)
+    return _render_claim_items(raw_claims, source_label="docs", url=docs_url, limit=4)
+
+
+def _product_mechanics_items(profile) -> list[str]:
+    items: list[str] = []
+    docs_url = _preferred_docs_url(profile)
+    entities = _key_entities_claim(profile)
+    if entities:
+        items.append(_with_source(entities, "docs", docs_url))
+    if getattr(profile, "supported_chains", None):
+        items.append(_with_source(f"Поддерживаемые сети: {', '.join(profile.supported_chains[:8])}.", "docs", docs_url))
+    for snippet in _evidence_claims(profile)[:3]:
+        items.append(_with_source(snippet["claim"], _source_label_for_url(snippet.get("url")), snippet.get("url")))
+    return items[:5]
+
+
+def _token_utility_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    token_url = _first_profile_url(profile, profile.official_urls.get("tokenomics") or profile.official_urls.get("docs") or profile.docs_urls_read)
+    raw_claims = (
+        interpretation.token_utility_section_claims
+        if interpretation is not None
+        else _token_utility_fallback_claims(profile, interpretation=interpretation)
+    )
+    return _render_claim_items(raw_claims, source_label="tokenomics", url=token_url, limit=6)
+
+
+def _value_capture_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    token_url = _first_profile_url(
+        profile,
+        profile.official_urls.get("tokenomics") or profile.official_urls.get("governance") or profile.docs_urls_read,
+    )
+    raw_claims = (
+        interpretation.value_capture_section_claims
+        if interpretation is not None
+        else _value_capture_fallback_claims(profile, interpretation=interpretation)
+    )
+    return _render_claim_items(raw_claims, source_label="tokenomics", url=token_url, limit=5)
+
+
+def _tokenomics_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    token_url = _first_profile_url(profile, profile.official_urls.get("tokenomics") or profile.docs_urls_read)
+    raw_claims = (
+        interpretation.tokenomics_section_claims
+        if interpretation is not None
+        else _tokenomics_fallback_claims(profile, interpretation=interpretation)
+    )
+    return _render_claim_items(raw_claims, source_label="tokenomics", url=token_url, limit=6)
+
+
+def _token_distribution_items(profile) -> list[str]:
+    items: list[str] = []
+    token_url = _first_profile_url(profile, profile.official_urls.get("tokenomics") or profile.docs_urls_read)
+    for claim in [
+        _clean_doc_claim(str(item), kind="token_role")
+        for item in (getattr(profile, "token_distribution_points", []) or [])
+    ]:
+        if claim:
+            items.append(_with_source(claim, "tokenomics", token_url))
+    return _dedupe_text_items(items)[:4]
+
+
+def _revenue_model_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    token_url = _first_profile_url(profile, profile.official_urls.get("tokenomics") or profile.docs_urls_read)
+    raw_claims = (
+        interpretation.revenue_model_section_claims
+        if interpretation is not None
+        else _revenue_model_fallback_claims(profile, interpretation=interpretation)
+    )
+    return _render_claim_items(raw_claims, source_label="tokenomics", url=token_url, limit=5)
+
+
+def _demand_driver_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    docs_url = _preferred_docs_url(profile)
+    raw_claims = (
+        interpretation.demand_driver_section_claims
+        if interpretation is not None
+        else _demand_driver_fallback_claims(profile, interpretation=interpretation)
+    )
+    return _render_claim_items(raw_claims, source_label="docs", url=docs_url, limit=5)
+
+
+def _project_overview_fallback_claims(profile, *, docs_result) -> list[str]:
+    claims: list[str] = []
+    overview = _clean_doc_claim(getattr(profile, "what_the_project_does", None), kind="overview")
+    if overview:
+        claims.append(overview)
+    else:
+        fallback_summary = _clean_doc_claim(getattr(docs_result, "summary", None), kind="overview")
+        if fallback_summary:
+            claims.append(fallback_summary)
+    classification = _project_classification_claim(profile)
+    if classification:
+        claims.append(classification)
+    business_model = _business_model_claim(profile)
+    if business_model:
+        claims.append(f"Как сам проект монетизирует или позиционирует себя: {business_model}")
+    return claims
+
+
+def _token_utility_fallback_claims(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    claims: list[str] = []
+    token_exists = getattr(profile, "token_exists", None)
+    if token_exists is True:
+        claims.append("В документации явно присутствует нативный токен проекта.")
+    elif token_exists is False:
+        claims.append("В изученной документации не видно явного нативного токена проекта.")
+    token_role = interpretation.token_role if interpretation is not None else _clean_doc_claim(getattr(profile, "token_role", None), kind="token_role")
+    if token_role:
+        claims.append(f"Роль токена: {token_role}")
+    claims.extend(_token_utility_claims(profile, interpretation=interpretation))
+    if getattr(profile, "governance_present", None):
+        claims.append("Governance-механика в документации раскрыта явно.")
+    return claims
+
+
+def _value_capture_fallback_claims(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    claims: list[str] = []
+    token_role = interpretation.token_role if interpretation is not None else _clean_doc_claim(getattr(profile, "token_role", None), kind="token_role")
+    if token_role and any(token in token_role.lower() for token in ("комисс", "fees", "fee", "revenue", "protocol fees", "gauge", "vecrv")):
+        claims.append(token_role)
+    claims.extend(interpretation.value_capture_claims if interpretation is not None else [
+        item for item in [_clean_doc_claim(str(raw), kind="token_role") for raw in (getattr(profile, "value_capture_points", []) or [])] if item
+    ])
+    claims.extend(interpretation.fee_recipient_claims if interpretation is not None else [
+        item for item in [_clean_doc_claim(str(raw), kind="fact") for raw in (getattr(profile, "fee_recipient_points", []) or [])] if item
+    ])
+    claims.extend(interpretation.product_token_link_claims if interpretation is not None else [
+        item for item in [_clean_doc_claim(str(raw), kind="fact") for raw in (getattr(profile, "product_token_link_points", []) or [])] if item
+    ])
+    revenue_model = _effective_revenue_model_claim(profile, interpretation=interpretation)
+    if revenue_model:
+        claims.append(f"Модель выручки: {revenue_model}")
+    return claims
+
+
+def _tokenomics_fallback_claims(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    claims: list[str] = []
+    if getattr(profile, "tokenomics_present", None):
+        claims.append("В документации есть отдельные tokenomics-разделы или упоминания токеномики.")
+    token_role = interpretation.token_role if interpretation is not None else _clean_doc_claim(getattr(profile, "token_role", None), kind="token_role")
+    if token_role:
+        claims.append(f"Tokenomics-механика токена: {token_role}")
+    claims.extend(f"Tokenomics-механика токена: {claim}" for claim in _token_utility_claims(profile, interpretation=interpretation))
+    claims.extend(interpretation.tokenomics_claims if interpretation is not None else [
+        item for item in [_clean_doc_claim(str(raw), kind="token_role") for raw in (getattr(profile, "tokenomics_points", []) or [])] if item
+    ])
+    claims.extend(f"Экономическая механика токена: {claim}" for claim in (
+        interpretation.value_capture_claims if interpretation is not None else [
+            item for item in [_clean_doc_claim(str(raw), kind="token_role") for raw in (getattr(profile, "value_capture_points", []) or [])] if item
+        ]
+    ))
+    claims.extend(f"Связь продукта и токена: {claim}" for claim in (
+        interpretation.product_token_link_claims if interpretation is not None else [
+            item for item in [_clean_doc_claim(str(raw), kind="fact") for raw in (getattr(profile, "product_token_link_points", []) or [])] if item
+        ]
+    ))
+    claims.extend(
+        claim
+        for claim in (_clean_doc_claim(str(item), kind="fact") for item in (getattr(profile, "vesting_points", []) or []))
+        if claim
+    )
+    return claims
+
+
+def _revenue_model_fallback_claims(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    claims: list[str] = []
+    revenue_model = _effective_revenue_model_claim(profile, interpretation=interpretation)
+    if revenue_model:
+        claims.append(revenue_model)
+    claims.extend(interpretation.revenue_model_claims if interpretation is not None else [
+        item for item in [_clean_doc_claim(str(raw), kind="revenue_model") for raw in (getattr(profile, "revenue_model_points", []) or [])] if item
+    ])
+    claims.extend(interpretation.fee_recipient_claims if interpretation is not None else [
+        item for item in [_clean_doc_claim(str(raw), kind="fact") for raw in (getattr(profile, "fee_recipient_points", []) or [])] if item
+    ])
+    return claims
+
+
+def _demand_driver_fallback_claims(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    claims: list[str] = []
+    overview = interpretation.overview if interpretation is not None else _clean_doc_claim(getattr(profile, "what_the_project_does", None), kind="overview")
+    if overview:
+        claims.append(f"Спрос на продукт должен идти из описанного use case: {overview}")
+    business_model = _business_model_claim(profile, interpretation=interpretation)
+    if business_model:
+        claims.append(f"Спрос на продукт и сеть логически связан с этой моделью: {business_model}")
+    claims.extend(
+        f"Спрос на токен по docs связан со следующим механизмом: {claim}"
+        for claim in _token_utility_claims(profile, interpretation=interpretation)
+        if any(term in claim.lower() for term in ("governance", "staking", "fee", "emission", "buyback", "security"))
+    )
+    return claims
+
+
+def _team_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    team_url = _first_profile_url(
+        profile,
+        profile.official_urls.get("team") or profile.official_urls.get("overview") or profile.docs_urls_read,
+    )
+    raw_claims = (
+        interpretation.team_claims if interpretation is not None else (
+            _clean_doc_claim(str(raw), kind="fact")
+            for raw in (getattr(profile, "team_points", []) or [])
+        )
+    )
+    return _render_claim_items(raw_claims, source_label="docs", url=team_url, limit=4)
+
+
+def _investors_and_partners_items(
+    profile,
+    blog_claims: list[str],
+    *,
+    interpretation: DocumentationInterpretation | None = None,
+) -> list[str]:
+    partner_url = _first_profile_url(
+        profile,
+        profile.official_urls.get("partners") or profile.official_urls.get("team") or profile.docs_urls_read,
+    )
+    raw_claims = (
+        interpretation.investors_partners_claims if interpretation is not None else (
+            _clean_doc_claim(str(raw), kind="fact")
+            for raw in (getattr(profile, "investor_partner_points", []) or [])
+        )
+    )
+    items = _render_claim_items(raw_claims, source_label="docs", url=partner_url, limit=6)
+    partner_blog_claims = [
+        claim for claim in blog_claims
+        if any(term in claim.lower() for term in ("partner", "partnership", "integration", "integrat", "интеграц", "партнер"))
+    ]
+    return _dedupe_text_items(items + partner_blog_claims)[:6]
+
+
+def _security_items(profile) -> list[str]:
+    items: list[str] = []
+    security_url = _first_profile_url(profile, profile.official_urls.get("audits") or profile.official_urls.get("security") or profile.docs_urls_read)
+    audit_detail = _audit_detail_claim(profile)
+    if audit_detail:
+        items.append(_with_source(audit_detail, "security", security_url))
+    elif getattr(profile, "audits_present", None):
+        items.append(_with_source("В документации есть упоминание audits или security review.", "security", security_url))
+    for claim in _security_highlight_claims(profile)[:3]:
+        items.append(_with_source(claim["claim"], "security", claim.get("url")))
+    return _dedupe_text_items(items)[:5]
+
+
+def _governance_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    token_url = _first_profile_url(
+        profile,
+        profile.official_urls.get("governance") or profile.official_urls.get("tokenomics") or profile.docs_urls_read,
+    )
+    raw_claims = (
+        interpretation.governance_section_claims if interpretation is not None else (
+            _clean_doc_claim(str(raw), kind="token_role")
+            for raw in (getattr(profile, "governance_points", []) or [])
+        )
+    )
+    return _render_claim_items(raw_claims, source_label="governance", url=token_url, limit=5)
+
+
+def _treasury_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    token_url = _first_profile_url(
+        profile,
+        profile.official_urls.get("treasury") or profile.official_urls.get("governance") or profile.official_urls.get("tokenomics") or profile.docs_urls_read,
+    )
+    raw_claims = (
+        interpretation.treasury_section_claims if interpretation is not None else (
+            _clean_doc_claim(str(raw), kind="token_role")
+            for raw in (getattr(profile, "treasury_points", []) or [])
+        )
+    )
+    return _render_claim_items(raw_claims, source_label="tokenomics", url=token_url, limit=4)
+
+
+def _roadmap_items(
+    profile,
+    blog_claims: list[str],
+    *,
+    interpretation: DocumentationInterpretation | None = None,
+) -> list[str]:
+    roadmap_url = _first_profile_url(
+        profile,
+        profile.official_urls.get("roadmap") or profile.official_urls.get("docs") or profile.docs_urls_read,
+    )
+    raw_claims = (
+        interpretation.roadmap_claims if interpretation is not None else (
+            _clean_doc_claim(str(raw), kind="fact")
+            for raw in (getattr(profile, "roadmap_points", []) or [])
+        )
+    )
+    items = _render_claim_items(raw_claims, source_label="docs", url=roadmap_url, limit=5)
+    roadmap_blog_claims = [
+        claim for claim in blog_claims
+        if any(term in claim.lower() for term in ("launch", "release", "roadmap", "upgrade", "update", "запуск", "релиз", "обновлен"))
+    ]
+    return _dedupe_text_items(items + roadmap_blog_claims)[:5]
+
+
+def _risk_items(profile) -> list[str]:
+    items: list[str] = []
+    risk_url = _first_profile_url(profile, profile.official_urls.get("security") or profile.docs_urls_read)
+    for risk in (getattr(profile, "risk_factors", []) or [])[:5]:
+        cleaned = _clean_doc_claim(risk, kind="risk")
+        if cleaned:
+            items.append(_with_source(cleaned, "security", risk_url))
+    return _dedupe_text_items(items)[:5]
+
+
+def _red_flag_items(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    items: list[str] = []
+    business_model = _business_model_claim(profile, interpretation=interpretation)
+    revenue_model = _effective_revenue_model_claim(profile, interpretation=interpretation)
+    if not _token_utility_claims(profile, interpretation=interpretation) and getattr(profile, "token_exists", None):
+        items.append("Токен описан, но его практическая utility по изученной документации раскрыта слабо.")
+    if not business_model and not revenue_model:
+        items.append("Бизнес-модель и модель выручки проекта по изученной документации остаются неясными.")
+    elif business_model and not revenue_model:
+        items.append("Высокоуровневая бизнес-модель понятна, но конкретная модель выручки по изученной документации раскрыта слабо.")
+    if not getattr(profile, "tokenomics_present", None):
+        items.append("В изученной документации нет явной и полноценной секции по токеномике.")
+    if not getattr(profile, "audits_present", None) and not getattr(profile, "security_section_present", None):
+        items.append("Раскрытие вопросов безопасности в изученной документации выглядит слабым.")
+    if not getattr(profile, "risk_factors", None):
+        items.append("Проект почти не фиксирует собственные риски и ограничения.")
+    return items[:5]
+
+
+def _official_blog_claims(blog_result, *, limit: int) -> list[str]:
+    items: list[str] = []
+    for post in getattr(blog_result, "posts", []) or []:
+        if _looks_like_ambiguous_zero_blog_post(post):
+            continue
+        date_text = post.published_at.date().isoformat() if post.published_at else "без даты"
+        summary = _render_official_blog_claim(post.summary)
+        if summary:
+            items.append(_with_source(f"{date_text}: {summary}", "official_blog", post.url))
+        for point in post.key_points[:3]:
+            rendered = _render_official_blog_claim(point)
+            if rendered:
+                items.append(_with_source(rendered, "official_blog", post.url))
+    return _dedupe_text_items(items)[:limit]
+
+
+def _looks_like_ambiguous_zero_blog_post(post) -> bool:
+    url = str(getattr(post, "url", "") or "").lower()
+    title = str(getattr(post, "title", "") or "").lower()
+    text = " ".join(
+        [
+            str(getattr(post, "summary", "") or ""),
+            *(str(point or "") for point in (getattr(post, "key_points", []) or [])),
+        ]
+    ).lower()
+    if "layerzero.network" not in url:
+        return False
+    if "/zero" not in url and "zero thesis" not in title:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "multi-core world computer",
+            "atomicity zone",
+            "system zone",
+            "single-threaded",
+            "l2s periodically post",
+        )
+    )
+
+
+def _documentation_strengths(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    if interpretation is not None:
+        return interpretation.documentation_strengths
+    strengths: list[str] = []
+    if (
+        (interpretation.overview if interpretation is not None else _clean_doc_claim(getattr(profile, "what_the_project_does", None), kind="overview"))
+        or _business_model_claim(profile, interpretation=interpretation)
+        or _project_classification_claim(profile)
+    ):
+        strengths.append("понятное позиционирование продукта")
+    if _token_utility_claims(profile, interpretation=interpretation):
+        strengths.append("есть конкретика по utility токена")
+    if getattr(profile, "audits_present", None) or getattr(profile, "security_section_present", None):
+        strengths.append("есть хотя бы базовое security-раскрытие")
+    if getattr(profile, "governance_present", None):
+        strengths.append("governance-механика описана")
+    if getattr(profile, "supported_chains", None):
+        strengths.append("понятен сетевой охват продукта")
+    return strengths or ["минимальная базовая документация присутствует"]
+
+
+def _final_project_summary(*, target, profile, overview: str | None, business_model: str | None) -> str:
+    if overview:
+        return overview
+    if business_model:
+        return f"{target.name}: {business_model}"
+    classification_summary = _project_classification_summary(profile, target_name=getattr(target, "name", ""))
+    if classification_summary:
+        return classification_summary
+    return f"{target.name}: по официальной документации видно общее назначение проекта, но подробное вводное описание извлечь не удалось."
+
+
+def _project_classification_summary(profile, *, target_name: str) -> str | None:
+    project_type = str(getattr(profile, "project_type", "") or "").strip()
+    subtype = str(getattr(profile, "project_subtype", "") or "").strip()
+    if not project_type or project_type in {"unknown_other", "unknownother"}:
+        return None
+    project_type_label = _translate_project_type(project_type)
+    subtype_label = _translate_project_subtype(subtype) if subtype else ""
+    if subtype_label:
+        return f"{target_name}: {project_type_label}, подтип: {subtype_label}."
+    return f"{target_name}: {project_type_label}."
+
+
+def _documentation_weaknesses(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    if interpretation is not None:
+        return interpretation.documentation_weaknesses
+    weaknesses: list[str] = []
+    business_model = _business_model_claim(profile, interpretation=interpretation)
+    revenue_model = _effective_revenue_model_claim(profile, interpretation=interpretation)
+    if not business_model and not revenue_model:
+        weaknesses.append("неясна бизнес-модель и модель выручки")
+    elif business_model and not revenue_model:
+        weaknesses.append("не хватает конкретики по модели выручки")
+    if not getattr(profile, "risk_factors", None):
+        weaknesses.append("слабое раскрытие рисков")
+    if not getattr(profile, "audit_providers", None) and not getattr(profile, "audits_present", None):
+        weaknesses.append("мало конкретики по security и audits")
+    if not getattr(profile, "tokenomics_present", None):
+        weaknesses.append("нет явной tokenomics-структуры")
+    if not _token_utility_claims(profile, interpretation=interpretation) and getattr(profile, "token_exists", None):
+        weaknesses.append("utility токена раскрыта слабо")
+    return weaknesses or ["крупных слабых мест по docs автоматически не выделено"]
+
+
+def _critical_docs_gaps(profile, *, interpretation: DocumentationInterpretation | None = None) -> str:
+    if interpretation is not None:
+        gaps = interpretation.critical_gaps
+        if not gaps:
+            return "критических пробелов на текущем уровне extraction не выявлено"
+        return ", ".join(gaps)
+    gaps: list[str] = []
+    if not getattr(profile, "tokenomics_present", None):
+        gaps.append("детальной tokenomics")
+    if not getattr(profile, "vesting_points", None):
+        gaps.append("vesting / unlock schedule")
+    if not _effective_revenue_model_claim(profile, interpretation=interpretation):
+        gaps.append("понятной модели выручки")
+    if not _has_fee_flow_detail(profile, interpretation=interpretation):
+        gaps.append("кто получает fees / revenue")
+    if not _has_treasury_control_detail(profile, interpretation=interpretation):
+        gaps.append("кто управляет treasury")
+    if not getattr(profile, "risk_factors", None):
+        gaps.append("явного risk disclosure")
+    if not getattr(profile, "audit_providers", None) and not getattr(profile, "audits_present", None):
+        gaps.append("конкретики по audits / bug bounty")
+    if not gaps:
+        return "критических пробелов на текущем уровне extraction не выявлено"
+    return ", ".join(gaps)
+
+
+def _token_looks_needed(profile, *, interpretation: DocumentationInterpretation | None = None) -> bool:
+    claims = _token_utility_claims(profile, interpretation=interpretation)
+    claims.extend(
+        [
+            cleaned
+            for cleaned in (
+                _clean_doc_claim(str(item), kind="fact")
+                for item in (getattr(profile, "product_token_link_points", []) or [])
+            )
+            if cleaned
+        ]
+    )
+    if not claims:
+        return False
+    joined = " ".join(claims).lower()
+    return any(term in joined for term in ("governance", "staking", "комис", "fees", "security", "эмис", "vote"))
+
+
+def _effective_revenue_model_claim(profile, *, interpretation: DocumentationInterpretation | None = None) -> str | None:
+    if interpretation is not None and interpretation.revenue_model:
+        return interpretation.revenue_model
+    direct = _clean_doc_claim(getattr(profile, "revenue_model", None), kind="revenue_model")
+    if direct:
+        return direct
+    for item in (getattr(profile, "revenue_model_points", []) or []):
+        cleaned = _clean_doc_claim(str(item), kind="revenue_model")
+        if cleaned:
+            return cleaned
+    for item in (getattr(profile, "fee_recipient_points", []) or []):
+        cleaned = _clean_doc_claim(str(item), kind="fact")
+        if cleaned and any(token in cleaned.lower() for token in ("fees", "revenue", "комис", "treasury", "holders", "stakers")):
+            return cleaned
+    return None
+
+
+def _has_fee_flow_detail(profile, *, interpretation: DocumentationInterpretation | None = None) -> bool:
+    if interpretation is not None:
+        return interpretation.fee_flow_detail_present
+    if getattr(profile, "fee_recipient_points", None):
+        return True
+    token_role = _clean_doc_claim(getattr(profile, "token_role", None), kind="token_role")
+    if token_role and any(token in token_role.lower() for token in ("комисс", "fees", "fee", "revenue", "protocol fees")):
+        return True
+    for item in (getattr(profile, "value_capture_points", []) or []):
+        cleaned = _clean_doc_claim(str(item), kind="fact")
+        if cleaned and any(token in cleaned.lower() for token in ("fees", "revenue", "buyback", "burn", "treasury", "holders", "stakers")):
+            return True
+    return False
+
+
+def _has_treasury_control_detail(profile, *, interpretation: DocumentationInterpretation | None = None) -> bool:
+    if interpretation is not None:
+        return interpretation.treasury_control_detail_present
+    if getattr(profile, "treasury_control_points", None):
+        return True
+    for item in (getattr(profile, "treasury_points", []) or []):
+        cleaned = _clean_doc_claim(str(item), kind="fact")
+        if cleaned and any(token in cleaned.lower() for token in ("governance", "dao", "vote", "treasury", "allocat", "direct")):
+            return True
+    return False
+
+
+def _with_source(text: str, source_label: str, url: str | None) -> str:
+    del source_label, url
+    return text
+
+
+def _source_label_for_url(url: str | None) -> str:
+    text = (url or "").lower()
+    if "whitepaper" in text or text.endswith(".pdf"):
+        return "whitepaper"
+    if "governance" in text:
+        return "governance"
+    if "faq" in text:
+        return "faq"
+    if "blog" in text or "news" in text:
+        return "blog"
+    if "token" in text or "econom" in text:
+        return "tokenomics"
+    if "security" in text or "audit" in text:
+        return "security"
+    return "docs"
+
+
+def _dedupe_text_items(items: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = re.sub(r"\s+", " ", item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _render_claim_items(raw_claims, *, source_label: str, url: str | None, limit: int) -> list[str]:
+    items: list[str] = []
+    for claim in raw_claims:
+        if claim:
+            items.append(_with_source(claim, source_label, url))
+    return _dedupe_text_items(items)[:limit]
+
+
+def _normalize_source_urls(value: str | None) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    matches = re.findall(r"https?://.*?(?=(?:https?://)|$)", text)
+    if not matches:
+        return [text]
+    normalized: list[str] = []
+    for match in matches:
+        cleaned = match.strip(" \t\r\n-–—,;)")
+        cleaned = cleaned.rstrip(".,);:-")
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized or [text]
+
+
+def _first_url(urls: list[str] | None, *, allowed_roots: set[str] | None = None) -> str | None:
+    return next((url for url in (urls or []) if _is_allowed_source_url(url, allowed_roots=allowed_roots)), None)
+
+
+def _first_profile_url(profile, urls: list[str] | None) -> str | None:
+    return _first_url(urls, allowed_roots=_trusted_project_root_domains(profile))
+
+
+def _preferred_docs_url(profile) -> str | None:
+    for key in ("docs", "overview", "product", "tokenomics", "governance", "treasury", "team", "partners", "roadmap", "security"):
+        url = _first_profile_url(profile, (profile.official_urls or {}).get(key) or [])
+        if url:
+            return url
+    return _first_profile_url(profile, getattr(profile, "docs_urls_read", []) or [])
+
+
+def _clean_doc_claim(value: str | None, *, kind: str) -> str | None:
+    text = " ".join((value or "").split()).strip(" -,:;")
+    if not text:
+        return None
+    text = re.sub(r"^#{1,6}\s*", "", text).strip()
+    text = re.sub(r"^\|\s*", "", text).strip()
+    text = re.sub(r"^[\-\u2192|]+\s*", "", text).strip()
+    text = _dedupe_repeated_phrase(text)
+    text = re.sub(r"\s*Subtype:\s*[A-Za-z0-9_-]+\.*$", "", text, flags=re.IGNORECASE).strip(" -,:;")
+    if kind == "token_role" and text.startswith("holders of the protocol"):
+        text = "Governance-токен используется для предложения и голосования за изменения протокола."
+
+    lowered = text.lower()
+    if _looks_like_binary_or_pdf_garbage(text):
+        return None
+    boilerplate_terms = (
+        "skip to content",
+        "search ctrl",
+        "powered by gitbook",
+        "terms of use",
+        "privacy policy",
+        "contact us",
+        "on this page",
+        "important links",
+        "no liability",
+        "you acknowledge and agree",
+        "you shall not violate",
+        "binding agreement",
+    )
+    if sum(1 for term in boilerplate_terms if term in lowered) >= 1 and kind in {"overview", "risk", "revenue_model"}:
+        return None
+
+    marketing_terms = (
+        "drive new revenue",
+        "boost user retention",
+        "wordmark",
+        "logomark",
+        "brand assets",
+        "knowledge hub",
+        "build on curve",
+        "skip to main content",
+        "your gateway to understanding and building with",
+        "visualizations search blog links",
+        "developers get started docs devhub",
+        "popular developer resources",
+        "tutorials get involved",
+        "journalists agencies client login",
+        "please try again",
+        "builder quick links",
+        "quickstarts",
+        "resources for all products and use cases",
+        "developers developers docs builder quick links",
+        "liquid staking tokens (lsts)",
+        "liquid restaking tokens (lrts)",
+        "uniswap developers docs",
+        "api reference",
+        "api keys",
+        "quick start concepts",
+        "trading overview",
+        "liquidity overview",
+        "liquidity provisioning",
+        "liquidity launch",
+        "security researchers opportunities to offer and conduct efficient, well-matched security audits",
+        "curated opportunities",
+        "collaborative environment",
+        "cantina tools communication features",
+        "powered by this documentation is built and hosted on mintlify",
+        "assistant responses are generated using ai and may contain mistakes",
+    )
+    if any(term in lowered for term in marketing_terms):
+        return None
+
+    legal_terms = (
+        "terms of use",
+        "privacy policy",
+        "third-party services",
+        "binding agreement",
+        "no liability",
+        "issuer of any tokens",
+        "programmatically generated via the smart contracts",
+        "you acknowledge and agree",
+        "you shall not violate",
+        "sole discretion",
+        "eligibility for and amounts of the rewards",
+        "the manner in which such rewards will be paid",
+    )
+    if any(term in lowered for term in legal_terms):
+        return None
+    if any(
+        term in lowered
+        for term in (
+            "released into the public domain",
+            "trademarks remain with their owners",
+            "no warranty",
+            "collect your position data",
+            "what to check why it matters",
+            "unlock collateral",
+            "call free(uint wad)",
+            "community-wide marketing campaign",
+            "phase 4",
+            "one-directional conversion mechanism",
+            "price extrapolation",
+            "mkr-to-sky conversions",
+            "delayed upgrade penalty",
+            "every 3 months after, the penalty",
+        )
+    ):
+        return None
+
+    if kind in {"revenue_model", "risk"} and any(
+        term in lowered for term in ("terms of use", "privacy policy", "third-party services", "binding agreement")
+    ):
+        return None
+    if kind == "revenue_model" and any(
+        term in lowered
+        for term in (
+            "gas fees",
+            "zero fees",
+            "no fee",
+            "nofee",
+            "delayed upgrade penalty",
+            "one-directional conversion",
+            "unidirectionally via the mkrtosky function",
+            "price extrapolation",
+            "fee collection mechanism",
+            "converter contract",
+        )
+    ):
+        return None
+
+    if kind == "overview" and ("docs" in lowered and "protocol docs" in lowered):
+        return None
+    if text.endswith("?"):
+        return None
+    if kind == "token_role" and text[:1].islower() and not re.match(r"^(ve|s)[A-Z0-9]", text):
+        return None
+    if kind == "token_role" and any(
+        term in lowered for term in (
+            "referral code",
+            "share & invite",
+            "apy avg",
+            "supply users chains",
+            "digital dollars for the internet economy",
+            "earn 10% of what your friends earn",
+            "knowledge hub",
+            "skip to main content",
+            "getting started",
+            "popular developer resources",
+            "developers get started docs devhub",
+        )
+    ):
+        return None
+    if kind == "token_role" and any(
+        term in lowered for term in (
+            "gauges & emissions",
+            "system of liquidity gauges",
+            "curve knowledge hub",
+            "targets yield from defi assets like liquid staking tokens and lending protocols",
+            "market-leading stablecoin yield",
+            "deposit usds to earn governance tokens",
+            "sky protocol enables market-leading stablecoin yield",
+            "lock function no longer mints iou token balances",
+        )
+    ):
+        return None
+    if kind == "token_role" and "claimable by chainlink ecosystem participants" in lowered and "link stakers" in lowered:
+        return "LINK используется в механиках участия экосистемы, включая программы, где токены партнёрских проектов могут распределяться среди участников и eligible LINK-стейкеров."
+    if kind == "token_role" and "the fee is taken in the native token of the transaction" in lowered:
+        return None
+    if kind == "business_model" and lowered.startswith("connects suppliers and borrowers"):
+        text = "Протокол связывает заёмщиков и поставщиков ликвидности на ончейн-кредитных рынках."
+    if kind == "business_model" and "provides spot exchange liquidity and routing for token trading" in lowered:
+        text = "Проект обеспечивает ликвидность и маршрутизацию для спотовой торговли токенами."
+    if kind == "business_model" and "aggregates swap liquidity and routes orders across dexs or liquidity sources" in lowered:
+        text = "Проект агрегирует ликвидность и маршруты обменов между DEX/liquidity sources для лучшего исполнения swaps."
+    if kind == "business_model" and "facilitates perpetual trading markets and monetizes trading activity" in lowered:
+        text = "Проект обеспечивает работу рынков перпетуальной торговли и монетизирует торговую активность."
+    if kind == "business_model" and "issues a crypto-native synthetic dollar backed by collateral, custody, and hedging infrastructure" in lowered:
+        text = "Проект выпускает крипто-нативный синтетический доллар, обеспеченный залогом, кастоди и инфраструктурой хеджирования."
+    if kind == "business_model" and "automates vault-based capital allocation into yield strategies" in lowered:
+        text = "Проект автоматизирует распределение капитала по vault-стратегиям для получения доходности."
+    if kind == "business_model" and "enables users to tokenize, trade, and hedge future yield" in lowered:
+        text = "Проект позволяет токенизировать, торговать и хеджировать будущую доходность DeFi-активов."
+    if kind == "business_model" and "provides cross-chain messaging and interoperability infrastructure" in lowered:
+        text = "Проект предоставляет cross-chain messaging и interoperability-инфраструктуру для приложений между сетями."
+    if kind == "business_model" and "provides an ai-agent tokenization and commerce platform" in lowered:
+        text = "Проект предоставляет платформу для токенизации, запуска и ончейн-коммерции AI-агентов."
+    if kind == "business_model" and "provides decentralized wireless network infrastructure" in lowered:
+        text = "Проект предоставляет децентрализованную wireless-инфраструктуру, где hotspots обеспечивают IoT или mobile coverage, а пользователи платят за использование сети."
+    if kind == "business_model" and "tokenizes staked or restaked assets" in lowered:
+        text = "Проект токенизирует staked/restaked assets, позволяя сохранять ликвидность и получать staking/restaking yield."
+    if kind == "business_model" and "provides onchain asset-management products" in lowered:
+        text = "Проект предоставляет ончейн asset-management продукты: managed vaults, portfolios, indexes или автоматизированные стратегии."
+    if kind == "business_model" and "provides marketplace infrastructure for nft" in lowered:
+        text = "Проект предоставляет marketplace-инфраструктуру для NFT minting, listings, bids и secondary trading."
+    if kind == "business_model" and "provides a web3 gaming economy" in lowered:
+        text = "Проект строит Web3 gaming-экономику вокруг ончейн-активов, rewards или marketplace-флоу."
+    if kind == "business_model" and "provides socialfi or creator-network infrastructure" in lowered:
+        text = "Проект предоставляет SocialFi или creator-network инфраструктуру вокруг profiles, communities, creators или social graph."
+    if kind == "business_model" and "provides prediction or outcome markets" in lowered:
+        text = "Проект предоставляет prediction/outcome markets, где пользователи торгуют вероятностями событий и результатами market resolution."
+    if kind == "business_model" and "represents a community or meme token" in lowered:
+        text = "Проект выглядит как community/meme token; продуктовая utility и бизнес-модель должны подтверждаться отдельно в документации."
+    if kind == "business_model" and "provides ai infrastructure" in lowered:
+        text = "Проект предоставляет AI-инфраструктуру: inference, compute, model, agent или subnet marketplaces."
+    if kind == "business_model" and "provides a public blockchain network for payments, asset issuance, tokenization, and smart-contract transactions" in lowered:
+        text = "Проект предоставляет публичную блокчейн-сеть для платежей, выпуска активов, токенизации и smart-contract transactions."
+    if kind == "revenue_model" and "primary revenue likely comes from borrow demand, reserve spreads, and protocol fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт спроса на займы, процентных спредов резервов и протокольных комиссий."
+    if kind == "revenue_model" and "primary revenue likely comes from swap fees and protocol fee switches where enabled" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт комиссий за обмены и протокольной доли комиссий там, где включён соответствующий механизм."
+    if kind == "revenue_model" and "primary revenue likely comes from routing, aggregation, partner, or execution-related fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт routing/aggregation fees, partner integrations и execution-related fees."
+    if kind == "revenue_model" and "primary revenue likely comes from trading fees, funding-related flows, and liquidation activity" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт торговых комиссий, потоков, связанных с funding-механикой, и ликвидационной активности."
+    if kind == "revenue_model" and "primary revenue likely comes from gas or network fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт сетевых комиссий или комиссий за газ."
+    if kind == "revenue_model" and "primary revenue likely comes from staking or restaking fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт staking/restaking fees, validator commissions и protocol fee share от rewards."
+    if kind == "revenue_model" and "primary revenue likely comes from management fees, performance fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт management fees, performance fees, strategy fees или product spreads."
+    if kind == "revenue_model" and "primary revenue likely comes from marketplace trading fees, mint fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт marketplace trading fees, mint fees и creator-royalty/platform fee flows."
+    if kind == "revenue_model" and "primary revenue likely comes from marketplace fees, game-asset sales" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт marketplace fees, game-asset sales, platform fees и transaction fees."
+    if kind == "revenue_model" and "primary revenue likely comes from creator fees, platform fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт creator fees, platform fees, subscriptions, social transactions или marketplace fees."
+    if kind == "revenue_model" and "primary revenue likely comes from trading fees, market fees, settlement fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт trading fees, market fees, settlement fees или spread capture."
+    if kind == "revenue_model" and "primary revenue likely comes from compute, inference, model" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт compute, inference, model, API или marketplace usage fees."
+    if kind == "revenue_model" and "primary revenue likely comes from issuance, management, servicing, or spread capture" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт комиссий за выпуск, управление, обслуживание и захвата спреда."
+    if kind == "revenue_model" and "primary revenue likely comes from bridge or messaging fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт комиссий за мосты или межсетевые сообщения."
+    if kind == "revenue_model" and "primary revenue likely comes from cross-chain messaging, verification, executor, or bridge fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт cross-chain messaging, verification, executor или bridge fees."
+    if kind == "revenue_model" and "primary revenue likely comes from data feed usage and service fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт использования оракульных дата-фидов и сервисных комиссий."
+    if kind == "revenue_model" and "primary revenue likely comes from protocol spread capture, staking demand, and reserve or hedging-related flows" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт захвата спреда, спроса на стейкинг и потоков, связанных с резервами или хеджированием."
+    if kind == "revenue_model" and "primary revenue likely comes from infrastructure usage by clients or protocols" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт использования инфраструктуры клиентами и другими протоколами."
+    if kind == "revenue_model" and "primary revenue likely comes from management and performance fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт комиссий за управление и результат."
+    if kind == "revenue_model" and "primary revenue likely comes from yield-market trading fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт trading fees на yield-рынках, protocol fees и revenue share-механик."
+    if kind == "revenue_model" and "primary revenue likely comes from agent launch or creation fees" in lowered:
+        text = "Основная выручка протокола, вероятно, формируется за счёт комиссий за запуск или создание агентов, trading tax и комиссий agent commerce."
+    if kind == "revenue_model" and "primary revenue likely comes from network usage paid with data credits" in lowered:
+        text = "Основная модель выручки/спроса связана с network usage, оплачиваемым Data Credits, hotspot onboarding fees и burn-and-mint механикой HNT."
+    if kind == "revenue_model" and "protocol revenue comes from swap fees and routing fees" in lowered:
+        text = "Выручка протокола формируется за счёт swap fees и routing fees."
+    if kind == "revenue_model":
+        translated_revenue = _translate_known_revenue_claim(text)
+        if translated_revenue:
+            text = translated_revenue
+            lowered = text.lower()
+    if kind == "fact":
+        translated_fact = _translate_known_fact_claim(text)
+        if translated_fact:
+            text = translated_fact
+            lowered = text.lower()
+    if kind == "token_role":
+        translated_role = _translate_known_token_role(text)
+        if not translated_role:
+            translated_role = _translate_known_fact_claim(text)
+        if translated_role:
+            text = translated_role
+            lowered = text.lower()
+    if kind == "overview":
+        translated = _translate_known_overview(text)
+        if translated:
+            text = translated
+            lowered = text.lower()
+    if kind == "revenue_model" and any(term in lowered for term in ("drive new revenue", "boost user retention", "cut costs")):
+        return None
+
+    text = text.lstrip(", ").strip()
+    if len(text.split()) < 4 and not re.search(r"[А-Яа-яЁё]", text):
+        return None
+    if _looks_english_only(text) and kind in {"risk", "overview", "revenue_model", "token_role", "fact", "business_model"}:
+        return None
+    return text[:500]
+
+
+def _project_classification_claim(profile) -> str | None:
+    project_type = str(getattr(profile, "project_type", "") or "").strip()
+    subtype = str(getattr(profile, "project_subtype", "") or "").strip()
+    if not project_type or project_type in {"unknown_other", "unknownother"}:
+        return None
+    project_type_label = _translate_project_type(project_type)
+    subtype_label = _translate_project_subtype(subtype) if subtype else ""
+    if subtype:
+        return f"Документация относит проект к типу {project_type_label}, подтип: {subtype_label or subtype}."
+    return f"Документация относит проект к типу {project_type_label}."
+
+
+def _key_entities_claim(profile) -> str | None:
+    entities = [str(item).strip() for item in (getattr(profile, "key_product_entities", []) or []) if str(item).strip()]
+    if not entities:
+        return None
+    translated = [_translate_entity_token(item) for item in entities[:6]]
+    return f"Ключевые продуктовые модули или сущности из документации: {', '.join(translated)}."
+
+
+def _business_model_claim(profile, *, interpretation: DocumentationInterpretation | None = None) -> str | None:
+    if interpretation is not None:
+        return interpretation.business_model
+    raw_value = str(getattr(profile, "business_model", "") or "").strip()
+    cleaned = _clean_doc_claim(raw_value, kind="business_model")
+    if not cleaned:
+        return business_model_from_project_type(
+            str(getattr(profile, "project_type", "") or ""),
+            str(getattr(profile, "project_subtype", "") or "") or None,
+        )
+    return cleaned
+
+
+def _token_utility_claim(profile, *, interpretation: DocumentationInterpretation | None = None) -> str | None:
+    cleaned = _token_utility_claims(profile, interpretation=interpretation)
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return "; ".join(cleaned[:2])
+
+
+def _token_utility_claims(profile, *, interpretation: DocumentationInterpretation | None = None) -> list[str]:
+    if interpretation is not None:
+        return interpretation.token_utility_claims[:4]
+    items = [_clean_doc_claim(str(item), kind="token_role") for item in (getattr(profile, "token_utility_points", []) or [])]
+    cleaned = [_trim_token_utility_noise(item) for item in items if item and not _looks_like_docs_shell(item)]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in cleaned:
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped[:4]
+
+
+def _audit_detail_claim(profile) -> str | None:
+    providers = [str(item).strip() for item in (getattr(profile, "audit_providers", []) or []) if str(item).strip()]
+    highlights = [_clean_doc_claim(str(item), kind="risk") for item in (getattr(profile, "audit_highlights", []) or [])]
+    highlights = [item for item in highlights if item]
+    if providers and highlights:
+        return f"В официальных материалах есть упоминания аудитов/bug bounty; среди связанных провайдеров и платформ: {', '.join(providers[:5])}. {highlights[0]}"
+    if providers:
+        return f"В официальных материалах есть упоминания аудитов/bug bounty; среди связанных провайдеров и платформ: {', '.join(providers[:5])}."
+    if highlights:
+        return f"В официальных материалах есть упоминания аудитов/bug bounty: {highlights[0]}"
+    return None
+
+
+def _security_highlight_claims(profile) -> list[dict[str, str]]:
+    claims: list[dict[str, str]] = []
+    seen: set[str] = set()
+    source_url = _first_url(getattr(profile, "official_urls", {}).get("security") or getattr(profile, "docs_urls_read", []) or [])
+    for raw in getattr(profile, "security_highlights", []) or []:
+        claim = _clean_doc_claim(str(raw), kind="risk")
+        if not claim:
+            continue
+        key = claim.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        claims.append({"claim": claim, "url": source_url or ""})
+    return claims[:3]
+
+
+def _capability_flags_claim(profile) -> str | None:
+    flags: list[str] = []
+    if getattr(profile, "governance_present", None):
+        flags.append("governance")
+    if getattr(profile, "tokenomics_present", None):
+        flags.append("tokenomics")
+    if getattr(profile, "security_section_present", None):
+        flags.append("security")
+    if getattr(profile, "audits_present", None):
+        flags.append("audits")
+    if getattr(profile, "token_exists", None):
+        flags.append("native token")
+    if not flags:
+        return None
+    translated = [_translate_flag(flag) for flag in flags]
+    return f"В документации явно раскрыты: {', '.join(translated)}."
+
+
+def _evidence_claims(profile) -> list[dict[str, str]]:
+    claims: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in getattr(profile, "evidence_snippets", []) or []:
+        if not isinstance(item, dict):
+            continue
+        raw_text = item.get("text") or item.get("snippet") or item.get("claim") or ""
+        url = str(item.get("url") or "").strip()
+        if url and not _is_allowed_source_url(url):
+            continue
+        claim = _clean_doc_claim(str(raw_text), kind="overview")
+        if not claim or _looks_like_docs_shell(claim):
+            continue
+        key = claim.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        claims.append(
+            {
+                "claim": claim,
+                "url": url,
+            }
+        )
+    return claims
+
+
+def _dedupe_findings(findings: list[SectionFinding]) -> list[SectionFinding]:
+    deduped: list[SectionFinding] = []
+    seen: set[tuple[str, str, str]] = set()
+    for finding in findings:
+        key = (
+            finding.category,
+            finding.claim.strip().lower(),
+            (finding.citations[0] if finding.citations else ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(finding)
+    return deduped
+
+
+def _looks_like_docs_shell(text: str) -> bool:
+    lowered = _normalize_inline(text).lower()
+    shell_terms = (
+        "knowledge hub",
+        "skip to main content",
+        "developers get started docs",
+        "popular developer resources",
+        "visualizations search blog links",
+        "your gateway to understanding and building with",
+        "getting started gauges",
+        "resources investor relations journalists agencies",
+        "search search when typing in this field",
+        "staff writer reviewed by",
+        "cointelegraph in your social feed",
+        "listen 0:00",
+        "accessibility statement",
+        "client login send a release",
+        "products about blog",
+        "blog zero developers",
+        "table of contents",
+        "what is a blockchain",
+        "the technology underlying the",
+        "decentralization-first",
+        "true decentralization is only possible",
+        "the zero thesis",
+        "13 min read table of contents",
+    )
+    return any(term in lowered for term in shell_terms)
+
+
+def _normalize_inline(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _trim_token_utility_noise(text: str | None) -> str | None:
+    value = _normalize_inline(text or "")
+    if not value:
+        return None
+    lowered = value.lower()
+    if any(token in lowered for token in ("jsx(", "components.", "children:", " }), ", '}), "\\n", jsx(', "__jsx")):
+        return None
+    if "governance the aave governance forum" in lowered:
+        return None
+    if any(
+        token in lowered
+        for token in (
+            "scoping and information gathering",
+            "main navigation",
+            "dashboard :",
+            "repositories :",
+            "home base with welcome message",
+            "organization’s unique risk profile",
+            "operational assessment",
+            "application assessment",
+            "put stablecoins to work",
+            "stablecoins aren’t built to sit still",
+            "the world’s largest yield-generating stablecoin",
+            "sky.money | put stablecoins to work",
+            "both ways if you like stablecoin yield",
+            "follow sky",
+        )
+    ):
+        return None
+    match = re.search(
+        r"(?:;|\s)\s*(Characteristics|Contract Structure|Deployment|Control Requirements|Retrofit)\s*:",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match and match.start() > 0:
+        value = value[: match.start()].rstrip(" ;,:")
+    return value[:500] if value else None
+
+
+def _is_allowed_source_url(url: str | None, *, allowed_roots: set[str] | None = None) -> bool:
+    text = (url or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"\s", text):
+        return False
+    host = (urlparse(text).hostname or "").lower()
+    if not host:
+        return False
+    blocked = (
+        "/legal",
+        "/legal/",
+        "/brand",
+        "/app",
+        "/dashboard",
+        "/terms",
+        "/privacy",
+        "/cookie",
+        "/pro",
+        "/llms.txt",
+        "/llms-full.txt",
+        "terms-of-use",
+        "privacy-policy",
+        "user-risks",
+        "cookie-policy",
+        "contact-us",
+        ".zip",
+        ".png",
+        ".svg",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        "defillama.com",
+        "tokenterminal.com",
+        "cointelegraph.com",
+        "coindesk.com",
+        "theblock.co",
+        "prnewswire.com",
+        "swift.com",
+        "cantina.xyz",
+    )
+    if any(item in text for item in blocked):
+        return False
+    if allowed_roots:
+        host_root = _registered_domain(host)
+        if host_root not in allowed_roots and not (host == "github.com" and "/audit" in text):
+            return False
+    return True
+
+
+def _trusted_project_root_domains(profile) -> set[str]:
+    roots: set[str] = set()
+    if profile is None:
+        return roots
+    official_urls = getattr(profile, "official_urls", {}) or {}
+    for key in ("website", "docs"):
+        for url in official_urls.get(key) or []:
+            host = (urlparse(str(url)).hostname or "").lower()
+            if host:
+                roots.add(_registered_domain(host))
+    for url in getattr(profile, "docs_urls_read", []) or []:
+        host = (urlparse(str(url)).hostname or "").lower()
+        if host and _registered_domain(host) in roots:
+            roots.add(_registered_domain(host))
+    return roots
+
+
+def _registered_domain(host: str) -> str:
+    parts = [part for part in (host or "").lower().split(".") if part]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host.lower()
+
+
+def _bullet_with_citation(text: str, url: str | None) -> str:
+    del url
+    return f"- {text}"
+
+
+def _dedupe_repeated_phrase(text: str) -> str:
+    words = text.split()
+    if len(words) >= 8 and len(words) % 2 == 0:
+        half = len(words) // 2
+        if " ".join(words[:half]).lower() == " ".join(words[half:]).lower():
+            return " ".join(words[:half])
+    return text
+
+
+def _extract_subject_name(text: str) -> str | None:
+    match = re.match(r"^([A-Z][A-Za-z0-9 ._-]{1,40})\s+(?:is|provides|-)\b", text)
+    if not match:
+        return None
+    return match.group(1).strip(" -")
+
+
+def _looks_english_only(text: str) -> bool:
+    letters = re.findall(r"[A-Za-zА-Яа-я]", text)
+    if not letters:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cyr = len(re.findall(r"[А-Яа-яЁё]", text))
+    return latin >= 20 and cyr == 0
+
+
+def _looks_english_token(text: str) -> bool:
+    return bool(re.fullmatch(r"[a-z][a-z0-9_-]*", text.lower()))
+
+
+def _looks_like_binary_or_pdf_garbage(text: str) -> bool:
+    lowered = (text or "").lower()
+    if any(token in lowered for token in ("endstream", "endobj", "/annots", "/mediabox", "/resources", "/type /page")):
+        return True
+    bad_chars = sum(1 for ch in text if ord(ch) < 9 or 13 < ord(ch) < 32 or ord(ch) == 65533)
+    non_ascii = sum(1 for ch in text if ord(ch) > 126)
+    if bad_chars >= 2:
+        return True
+    if len(text) >= 80 and non_ascii >= 10 and re.search(r"[A-Za-z0-9]{2,}.{0,3}[�]", text):
+        return True
+    return False
+
+
+def _translate_entity_token(text: str) -> str:
+    mapping = {
+        "markets": "рынки",
+        "reserves": "резервы",
+        "collateral": "залог",
+        "borrowers": "заёмщики",
+        "suppliers": "поставщики ликвидности",
+        "liquidity": "ликвидность",
+        "pools": "пулы",
+        "pairs": "пары",
+        "traders": "трейдеры",
+        "routes": "маршруты",
+        "positions": "позиции",
+        "liquidations": "ликвидации",
+        "vault": "хранилище",
+        "vaults": "хранилища",
+        "bridges": "мосты",
+        "governance": "управление",
+        "minting": "минтинг",
+        "redeeming": "погашение",
+        "backing assets": "обеспечивающие активы",
+        "custody": "кастоди",
+        "reserve fund": "резервный фонд",
+    }
+    return mapping.get(text.lower(), text)
+
+
+def _translate_flag(text: str) -> str:
+    mapping = {
+        "governance": "управление",
+        "tokenomics": "токеномика",
+        "security": "безопасность",
+        "audits": "аудиты",
+        "native token": "нативный токен",
+    }
+    return mapping.get(text, text)
+
+
+def _translate_known_revenue_claim(text: str) -> str | None:
+    lowered = _dedupe_repeated_phrase(text).lower()
+    if "supply rate is derived from borrower interest after protocol fees" in lowered:
+        return "Модель выручки lending-протокола связана с borrower interest после protocol fees; supply rate отражает спрос и предложение по активу."
+    if "borrower interest after protocol fees" in lowered:
+        return "Модель выручки lending-протокола связана с borrower interest после protocol fees."
+    if "borrowers pay interest" in lowered and "reserve factor" in lowered and "protocol treasury" in lowered:
+        return "Заёмщики Aave платят проценты, а reserve factor направляет долю protocol fees в treasury протокола."
+    if "borrowers pay interest" in lowered and "reserve factor" in lowered and "treasury" in lowered:
+        return "Заёмщики платят проценты, а reserve factor направляет долю protocol fees в treasury протокола."
+    if "protocol revenue comes from" in lowered and "swap fees" in lowered and "routing fees" in lowered:
+        return "Выручка протокола формируется за счёт swap fees и routing fees."
+    if "protocol revenue comes from" in lowered and "trading fees" in lowered and "liquidation" in lowered:
+        return "Выручка протокола формируется за счёт trading fees и потоков, связанных с ликвидациями."
+    if "protocol revenue comes from" in lowered and "management fees" in lowered:
+        return "Выручка протокола формируется за счёт management fees."
+    if "protocol revenue comes from" in lowered and "performance fees" in lowered:
+        return "Выручка протокола формируется за счёт performance fees."
+    if "protocol revenue comes from" in lowered and "service fees" in lowered:
+        return "Выручка протокола формируется за счёт service fees."
+    if "fees accrue to the protocol treasury" in lowered:
+        return "Комиссии начисляются в protocol treasury."
+    if "fees are routed to the protocol treasury" in lowered:
+        return "Комиссии направляются в protocol treasury."
+    if "data credits" in lowered and "mechanism by which all helium network usage is paid" in lowered:
+        return "Network usage в Helium оплачивается Data Credits."
+    if "data credits" in lowered and "only produced by burning hnt" in lowered:
+        return "Data Credits создаются только через burning HNT, связывая спрос на сеть с HNT burn."
+    if "data credits" in lowered and "wireless data transmissions" in lowered:
+        return "Data Credits используются для оплаты wireless data transmissions в Helium Network."
+    if "burn and mint" in lowered and "hnt" in lowered:
+        return "Burn-and-mint economics связывает usage сети с HNT supply через сжигание HNT для Data Credits."
+    if "creation fee" in lowered and ("agent" in lowered or "launch" in lowered):
+        return "Модель выручки agent-платформы включает creation fee за запуск агента."
+    if "trading tax" in lowered and ("agent" in lowered or "virtual" in lowered):
+        return "Agent-token trades облагаются trading tax; распределение tax формирует выручку/инцентивы протокола и экосистемы."
+    if "agent commerce" in lowered and ("fee" in lowered or "revenue" in lowered or "incentives" in lowered):
+        return "Agent Commerce-механика создаёт комиссии и incentives вокруг ончейн-транзакций AI-агентов."
+    if "inference payments" in lowered or "per-inference payments" in lowered:
+        return "Платежи за inference проходят в ончейн-экономике агентов и поддерживают спрос на токен/сервис."
+    if "curve fee architecture" in lowered and "swap fees" in lowered and "admin fees" in lowered:
+        return "Модель выручки Curve завязана на архитектуре комиссий: swap fees проходят через параметры pool fee и admin fees."
+    if "fixed 0.25% trading fee" in lowered and "pancakeswap treasury" in lowered and "cake buyback and burn" in lowered:
+        return "В PancakeSwap V2 применяется фиксированная trading fee 0.25%: часть возвращается LP, часть направляется в treasury, а часть — на CAKE buyback and burn."
+    if "trading fees" in lowered and "liquidity providers" in lowered and "cake burn" in lowered and "treasury" in lowered:
+        return "Trading fees распределяются между liquidity providers, CAKE Burn и treasury согласно fee tier конкретного пула."
+    if "cake burn receives a share of total swap fees" in lowered:
+        return "CAKE Burn получает долю total swap fees, что permanently removes CAKE и снижает supply."
+    if "borrowers pay interest" in lowered and "reserve factor" in lowered and "protocol treasury" in lowered:
+        return "Заёмщики Aave платят проценты, а reserve factor направляет долю protocol fees в treasury протокола."
+    if "captures revenue from reserve spreads" in lowered and "protocol fees" in lowered:
+        return "Протокол захватывает выручку через reserve spreads и protocol fees на lending-рынках."
+    if "vault owners pay a stability fee" in lowered and "protocol surplus buffer" in lowered:
+        return "Владельцы vault-позиций платят stability fee по сгенерированному USDS-долгу; эти комиссии начисляются в protocol surplus buffer."
+    if "protocol surplus collects stability fees" in lowered and "psm fees" in lowered:
+        return "Protocol surplus аккумулирует stability fees, liquidation penalties и PSM fees, после чего governance распределяет surplus через протокольные механизмы."
+    if "litepsm charges fees" in lowered and "spread income" in lowered:
+        return "LitePSM взимает комиссии за свопы между USDS и поддерживаемыми стейблкоинами, создавая spread income для протокола."
+    return None
+
+
+def _translate_known_fact_claim(text: str) -> str | None:
+    lowered = _dedupe_repeated_phrase(text).lower()
+    if "fees accrue to the protocol treasury" in lowered:
+        return "Комиссии начисляются в protocol treasury."
+    if "fees are routed to the protocol treasury" in lowered:
+        return "Комиссии направляются в protocol treasury."
+    if "protocol treasury receives a share of fees" in lowered:
+        return "Protocol treasury получает долю комиссий."
+    if "treasury is controlled by governance" in lowered or "treasury is controlled by the dao" in lowered:
+        return "Treasury контролируется governance/DAO."
+    if "governance can direct treasury resources toward ecosystem priorities" in lowered:
+        return "Governance может направлять treasury-ресурсы на приоритеты экосистемы."
+    if "the dao can direct treasury reserves toward ecosystem grants" in lowered:
+        return "DAO может направлять treasury reserves на ecosystem grants и программы поддержки ликвидности."
+    if "governance can direct treasury" in lowered:
+        return "Governance может направлять treasury-ресурсы на приоритеты протокола."
+    if "dao can direct treasury" in lowered:
+        return "DAO может направлять treasury-ресурсы на приоритеты протокола."
+    if "share of fees is distributed to stakers" in lowered:
+        return "Доля комиссий распределяется среди stakers."
+    if "share of fees is distributed to token holders" in lowered:
+        return "Доля комиссий распределяется среди держателей токена."
+    if "stakers receive a share of protocol fees" in lowered:
+        return "Stakers получают долю protocol fees."
+    if "stakers receive a share of protocol revenue" in lowered:
+        return "Stakers получают долю protocol revenue."
+    if "ripple leadership includes operators focused on enterprise payments" in lowered:
+        return "Руководство Ripple включает специалистов, сфокусированных на корпоративных платежах и расчётной инфраструктуре."
+    if "roadmap prioritizes expansion of payment corridors" in lowered:
+        return "Roadmap делает акцент на расширении платёжных коридоров и расчётных возможностей."
+    if "unlock schedule and vesting terms are described" in lowered:
+        return "В официальной token-документации описаны график unlock и условия vesting."
+    if "treasury resources are managed through governance-linked decision processes" in lowered:
+        return "Treasury-ресурсы управляются через процессы принятия решений, связанные с governance."
+    if "ripple documentation highlights enterprise liquidity partnerships" in lowered:
+        return "Документация Ripple выделяет корпоративные liquidity-партнёрства и ecosystem-интеграции."
+    if "tokenomics documentation describes supply and network-level token mechanics" in lowered:
+        return "Tokenomics-документация описывает supply и сетевые механики токена."
+    if "treasury and ecosystem allocations are referenced in official materials" in lowered:
+        return "В официальных материалах упоминаются treasury- и ecosystem-аллокации."
+    if "token mechanics are tied to network usage, liquidity, and governance participation" in lowered:
+        return "Механики токена связаны с использованием сети, ликвидностью и участием в governance."
+    if "operational and regulatory risks are documented" in lowered:
+        return "В security-материалах описаны операционные и регуляторные риски."
+    if "thirty percent of fees accrues to the treasury" in lowered and "locked linkp holders" in lowered:
+        return "30% комиссий начисляется в treasury, а оставшаяся часть распределяется locked LINKP holders."
+    if "protocol treasury receives a share of fees" in lowered and "ecosystem grants" in lowered:
+        return "Protocol treasury получает долю комиссий, а governance может направлять treasury reserves на ecosystem grants."
+    if "share of admin fees accrues to vecrv holders" in lowered and "protocol fees are retained by the dao" in lowered:
+        return "Часть admin fees начисляется veCRV holders, а protocol fees удерживаются DAO."
+    if "fixed 0.25% trading fee" in lowered and "pancakeswap treasury" in lowered and "cake buyback and burn" in lowered:
+        return "В PancakeSwap V2 trading fee 0.25% распределяется между LP, PancakeSwap Treasury и CAKE buyback and burn."
+    if "trading fees" in lowered and "liquidity providers" in lowered and "cake burn" in lowered and "treasury" in lowered:
+        return "Trading fees распределяются между liquidity providers, CAKE Burn и treasury согласно fee tier конкретного пула."
+    if "cake burn receives a share of total swap fees" in lowered:
+        return "CAKE Burn получает долю total swap fees, что permanently removes CAKE и снижает supply."
+    if "reserve factor directs a share of protocol fees to the protocol treasury" in lowered:
+        return "Reserve factor направляет долю protocol fees в treasury протокола."
+    if "fees accrue to the protocol surplus buffer" in lowered:
+        return "Комиссии начисляются в protocol surplus buffer."
+    if "governance allocates surplus through protocol mechanisms" in lowered:
+        return "Governance распределяет surplus через протокольные механизмы."
+    if "vow acts as the recipient of both the system surplus and system debt" in lowered:
+        return "Модуль Vow выступает получателем системного surplus и системного долга протокола."
+    if "governance can extract these accumulated fees" in lowered and "collect(to)" in lowered:
+        return "Governance может извлекать накопленные комиссии через функцию collect(to)."
+    if "governance can update the fee parameter" in lowered:
+        return "Governance может обновлять параметр комиссии, который определяет fee для конверсий MKR в SKY."
+    if "all parameters are governance-set and smart-contract-executed" in lowered:
+        return "Параметры задаются governance и исполняются смарт-контрактами соответствующего Sky Agent или ecosystem-партнёра."
+    if "stusds" in lowered and "risk capital" in lowered and "sky-backed borrowing" in lowered:
+        return "stUSDS описан как risk-capital инструмент, который финансирует SKY-backed borrowing."
+    return None
+
+
+def _translate_known_token_role(text: str) -> str | None:
+    lowered = _dedupe_repeated_phrase(text).lower()
+    staking_governance_match = re.search(
+        r"\b([A-Z][A-Z0-9]{1,12})\b can be staked to earn rewards and participate in governance",
+        text,
+    )
+    if staking_governance_match:
+        token = staking_governance_match.group(1)
+        return f"{token} можно стейкать для получения rewards и участия в governance."
+    holders_vote_match = re.search(
+        r"\b([A-Z][A-Z0-9]{1,12})\b holders can vote on governance proposals",
+        text,
+    )
+    if holders_vote_match:
+        token = holders_vote_match.group(1)
+        return f"Держатели {token} могут голосовать по governance proposals."
+    lock_emissions_match = re.search(
+        r"\b([A-Z][A-Z0-9]{1,12})\b can be locked to direct emissions toward liquidity pools",
+        text,
+    )
+    if lock_emissions_match:
+        token = lock_emissions_match.group(1)
+        return f"{token} можно блокировать, чтобы направлять emissions в liquidity pools."
+    if "token holders can vote on governance proposals" in lowered:
+        return "Держатели токена могут голосовать по governance proposals."
+    if "holders can vote on governance proposals" in lowered:
+        return "Держатели могут голосовать по governance proposals."
+    if "stakers receive a share of protocol fees" in lowered:
+        return "Stakers получают долю protocol fees."
+    if "stakers receive a share of protocol revenue" in lowered:
+        return "Stakers получают долю protocol revenue."
+    if "xrp is used for settlement and network liquidity" in lowered:
+        return "XRP используется для расчётов и сетевой ликвидности."
+    if "xrp supports network liquidity and settlement demand" in lowered:
+        return "XRP поддерживает сетевую ликвидность и спрос на расчёты в платёжных коридорах."
+    if ("xlm" in lowered or "lumens" in lowered) and "native currency" in lowered and "transaction fees" in lowered:
+        return "XLM является native currency сети Stellar и используется для transaction fees, rent и minimum balance requirements."
+    if "xlm is used to pay transaction fees" in lowered or "transaction fees are paid in lumens" in lowered:
+        return "XLM используется для оплаты transaction fees и поддержания minimum balance в сети Stellar."
+    if "all transaction fees are paid using the native stellar token" in lowered:
+        return "Все transaction fees в сети Stellar оплачиваются native token XLM."
+    if "data credits" in lowered and "derived from hnt" in lowered:
+        return "Data Credits derived from HNT используются для оплаты wireless data transmissions и network fees в Helium."
+    if "data credits" in lowered and "burning hnt" in lowered:
+        return "Data Credits создаются через burning HNT, что связывает usage сети с HNT burn-and-mint экономикой."
+    if "hnt serves the needs" in lowered and "hotspot" in lowered:
+        return "HNT используется для rewards Hotspot hosts/operators и связан с enterprise/developer usage через Data Credits."
+    if "token holders can participate in governance decisions" in lowered:
+        return "Держатели токена могут участвовать в governance-решениях, влияющих на работу сети."
+    if "linkp can be locked to direct emissions toward liquidity pools" in lowered:
+        return "LINKP можно блокировать, чтобы направлять emissions в liquidity pools, которые маршрутизируют наибольшую торговую активность."
+    if "aave can be staked in the safety module" in lowered:
+        return "AAVE можно стейкать в Safety Module."
+    if "aave token holders participate in governance voting" in lowered:
+        return "Держатели AAVE участвуют в governance voting."
+    if "all parameters are governance-set and smart-contract-executed" in lowered:
+        return "Параметры задаются governance и исполняются смарт-контрактами соответствующего Sky Agent или ecosystem-партнёра."
+    if "you earn sky agent governance tokens" in lowered:
+        return "Пользователь может получать governance-токены Sky Agents из ecosystem-проектов вроде Spark."
+    if "all sky agent tokens carry governance utility" in lowered:
+        return "Sky Agent tokens дают governance-utility в протоколах, которые участвуют в формировании выручки Sky Protocol."
+    if "supplying usds into the ecosystem rewards module" in lowered:
+        return "При размещении USDS в модуле Ecosystem Rewards пользователь может получать points или governance-токены от независимых capital allocators из Sky Agent Network."
+    if "stusds funds and supports liquidity for sky stakers" in lowered:
+        return "stUSDS финансирует и поддерживает ликвидность для SKY-стейкеров, усиливая участие в governance и безопасность экосистемы."
+    if "sky governance portal allows" in lowered and "sky holders to vote" in lowered:
+        return "Sky Governance Portal позволяет просматривать governance-предложения и голосовать держателям SKY."
+    if "this enables" in lowered and "native token has no economic value" in lowered:
+        match = re.search(r"This enables ([A-Za-z0-9_-]{2,40}) to support chains where the native token has no economic value", text, flags=re.IGNORECASE)
+        if match:
+            return f"Это позволяет {match.group(1)} поддерживать сети, где нативный токен не имеет собственной экономической ценности."
+        return "Это позволяет поддерживать сети, где нативный токен не имеет собственной экономической ценности."
+    if "payment for oracle services" in lowered and "payment abstraction" in lowered and "network security" in lowered:
+        return "LINK используется для оплаты oracle-услуг, payment abstraction, механизмов сетевой безопасности и reward-механик, а также cross-chain transfers в экосистеме Chainlink."
+    if "unified supply" in lowered and "no wrapped tokens" in lowered and "direct transfer model" in lowered:
+        return (
+            "Токен использует омничейн-модель с единым предложением между сетями, нативным представлением без wrapped-версий "
+            "и прямыми межсетевыми переводами между поддерживаемыми цепочками."
+        )
+    native_staking_match = re.search(
+        r"\b([A-Z]{2,10})\b is the protocol's native token, stakeable as \b(s[A-Z]{2,12})\b to earn protocol revenue\.?",
+        text,
+    )
+    if native_staking_match:
+        token = native_staking_match.group(1)
+        staked = native_staking_match.group(2)
+        return f"{token} — нативный токен протокола; его можно стейкать в {staked}, чтобы получать долю выручки протокола."
+    staking_receipt_match = re.search(
+        r"users stake \b([A-Z]{2,10})\b 1:1 to receive \b(s[A-Z]{2,12})\b, which earns a share of protocol revenue",
+        lowered,
+    )
+    if staking_receipt_match:
+        token = staking_receipt_match.group(1).upper()
+        staked = staking_receipt_match.group(2)
+        return f"Пользователи могут застейкать {token} в пропорции 1:1 и получить {staked}, который даёт право на долю выручки протокола."
+    liquid_staking_match = re.search(r"\b(s[A-Z]{2,12})\b is [A-Za-z0-9' -]+ liquid staking token\.?", text)
+    if liquid_staking_match:
+        staked = liquid_staking_match.group(1)
+        return f"{staked} выступает liquid staking token протокола."
+    if "the protocol is governed by aave token holders" in lowered or (
+        "aave token holders" in lowered and "governance framework" in lowered
+    ):
+        return "Токен AAVE используется для управления протоколом через децентрализованную систему governance."
+    if "aave is used as the centre of gravity of aave protocol governance" in lowered:
+        if "safety module" in lowered and "earn incentives" in lowered:
+            return (
+                "AAVE используется как основной токен governance протокола; "
+                "кроме этого, его можно стейкать в Safety Module, чтобы обеспечивать защитный бэкап протокола при shortfall event и получать за это вознаграждения."
+            )
+        return "AAVE используется как основной токен governance протокола."
+    if "can be staked within the protocol safety module" in lowered:
+        return (
+            "AAVE можно стейкать в Safety Module, чтобы обеспечивать защитный бэкап протокола при shortfall event и получать вознаграждения."
+        )
+    if "vote on token emissions" in lowered and "receive incentives and fees" in lowered:
+        return "NFT-механика проекта участвует в голосовании по распределению эмиссии токенов и получает вознаграждения и комиссии, генерируемые протоколом."
+    if "governance tokenholders are able to delegate everyday decision-making" in lowered:
+        token_match = re.search(r"\$([A-Z]{2,10})", text)
+        token = token_match.group(1) if token_match else "токен"
+        return (
+            f"Токен {token} используется для governance: держатели могут делегировать часть повседневных решений "
+            "по ключевым аспектам экосистемы профильным участникам, сохраняя прозрачность процесса."
+        )
+    if "staked ena can be obtained by staking ena" in lowered:
+        return "Пользователи могут застейкать ENA и получить sENA, который выступает ликвидным receipt-токеном."
+    if "ethena's synthetic dollar" in lowered and "delta-hedging" in lowered:
+        return "USDe выступает синтетическим долларом протокола и поддерживает устойчивость через дельта-хеджирование спотовых активов и использование ликвидных стейблов."
+    if "the $virtual token is the base liquidity pair and transactional currency across all ai agent interactions" in lowered:
+        return "$VIRTUAL выступает базовой валютной парой и расчётной валютой для взаимодействий между AI-агентами в экосистеме."
+    if "the $virtual token functions as the base liquidity pair and transactional currency across agent interactions" in lowered:
+        return "$VIRTUAL выступает базовой валютной парой и расчётной валютой для взаимодействий между агентами в экосистеме."
+    if "curve finance" in lowered and "used for voting" in lowered and "earning protocol fees" in lowered and "crv" in lowered:
+        return "CRV — governance-токен Curve Finance, который используется для голосования и получения части комиссий протокола."
+    if "curve dao token" in lowered and "vote-escrowed crv" in lowered:
+        return "CRV связан с governance-инфраструктурой Curve, veCRV-механикой, распределением комиссий и системой gauges."
+    if "gaugecontroller" in lowered and "crv inflation" in lowered and "vecrv votes" in lowered:
+        return "Через gauges и голоса veCRV определяется направление эмиссии CRV в пользу поставщиков ликвидности."
+    if "can be locked for governance" in lowered and "emissions voting" in lowered:
+        token_match = re.search(r"\b([A-Z]{2,10})\b", text)
+        token = token_match.group(1) if token_match else "Токен"
+        return f"{token} можно блокировать для governance и голосования по распределению эмиссии."
+    if "vote-escrow" in lowered or ("veaero" in lowered and "vote" in lowered):
+        return "veAERO отражает vote-escrow механику протокола: заблокированные токены участвуют в governance и голосовании по эмиссии."
+    if "the fee is taken in the native token of the transaction" in lowered:
+        return None
+    if "allocate up to 5% of supply to vevirtual stakers" in lowered:
+        return "veVIRTUAL-стейкеры могут получать распределения токенов в рамках airdrop-механик экосистемы."
+    if "2% to $virtual stakers and 3% to active ecosystem participants" in lowered:
+        return "$VIRTUAL-стейкеры и активные участники экосистемы участвуют в распределении части предложения токенов в отдельных механиках запуска."
+    if "restaked $ena" in lowered or ("add utility to $ena" in lowered and "restaking" in lowered):
+        return "Restaked ENA используется для экономической безопасности инфраструктурных модулей и кроссчейн-переводов в экосистеме Ethena."
+    if "governed by" in lowered and "token holders" in lowered:
+        token_match = re.search(r"\b([A-Z]{3,10})\b", text)
+        token = token_match.group(1) if token_match else "токен"
+        return f"{token} используется для управления протоколом через децентрализованную систему governance."
+    if "veaero" in lowered and "vote" in lowered:
+        if "receive incentives and fees generated by the protocol" in lowered:
+            return "veAERO отражает vote-escrow механику протокола: держатели участвуют в голосовании по эмиссии и получают incentives и комиссии протокола."
+        return "veAERO отражает vote-escrow механику протокола: заблокированные токены участвуют в governance и голосовании по эмиссии."
+    if "foundation" in lowered and ("buyback" in lowered or "buy back" in lowered):
+        return "Foundation использует свою долю доходов для развития протокола и buyback-механик."
+    if "receive incentives and fees generated by the protocol" in lowered:
+        return "Участники governance-механики получают incentives и комиссии, генерируемые протоколом."
+    if "protocol revenue" in lowered and ("distributed" in lowered or "share" in lowered):
+        return "Часть выручки протокола распределяется между держателями или стейкерами токена согласно механике протокола."
+    if ("epoch" in lowered or "epochs" in lowered) and ("emission" in lowered or "vote" in lowered):
+        return "В протоколе используются эпохи, в рамках которых распределяются эмиссия и результаты голосования."
+    if ("bribe" in lowered or "bribes" in lowered) and ("vote" in lowered or "voting" in lowered):
+        return "В governance-механике протокола присутствуют bribe-стимулы, связанные с голосованием за распределение эмиссии."
+    if ("lock" in lowered or "locked" in lowered) and ("weeks" in lowered or "months" in lowered):
+        return "Документация описывает lock-up механику токена с фиксированными периодами блокировки."
+    return None
+
+
+def _translate_known_overview(text: str) -> str | None:
+    lowered = text.lower()
+    protocol_name = _extract_subject_name(text)
+    subject = protocol_name or "Проект"
+
+    if "open source liquidity protocol" in lowered:
+        detail = []
+        if "supply assets" in lowered or "supply asset" in lowered:
+            detail.append("пользователи могут предоставлять активы")
+        if "earn yield" in lowered:
+            detail.append("получать доходность")
+        if "borrow against collateral" in lowered or "borrow assets against collateral" in lowered:
+            detail.append("брать займы под залог")
+        if detail:
+            return f"{subject} — открытый протокол ликвидности, где пользователи могут {'; '.join(detail)}."
+        return f"{subject} — открытый протокол ликвидности."
+
+    if "cross-border payments infrastructure" in lowered:
+        return f"{subject} предоставляет инфраструктуру для трансграничных платежей."
+
+    if "decentralized trading infrastructure" in lowered:
+        return f"{subject} предоставляет децентрализованную торговую инфраструктуру."
+
+    if "interoperability infrastructure across blockchains" in lowered:
+        return f"{subject} предоставляет инфраструктуру межсетевого взаимодействия между блокчейнами."
+
+    if "connects blockchains to real-world data" in lowered:
+        return f"{subject} соединяет блокчейны с внешними данными, другими блокчейнами и внешними системами через oracle-инфраструктуру."
+
+    if "synthetic dollar" in lowered and "backing" in lowered:
+        return f"{subject} — крипто-нативный синтетический доллар с обеспечением спотовыми активами, ончейн-кастоди и хеджированием через деривативы."
+
+    if "society of ai agents" in lowered:
+        return f"{subject} — ончейн-экосистема AI-агентов, где автономные агенты создают сервисы или продукты и взаимодействуют между собой и с пользователями."
+
+    if "coordinated, onchain ecosystem where autonomous agents generate services or products and engage in commerce" in lowered:
+        return f"{subject} — координируемая ончейн-экосистема автономных AI-агентов, которые создают продукты или сервисы и участвуют в экономической активности."
+
+    if "non-custodial perpetual exchange" in lowered:
+        if "order book" in lowered:
+            return f"{subject} — некастодиальная биржа перпетуалов с рыночной структурой на основе книги ордеров."
+        return f"{subject} — некастодиальная биржа перпетуалов."
+
+    if "central liquidity hub" in lowered and "base" in lowered:
+        return f"{subject} выступает центральным хабом ликвидности в экосистеме Base."
+
+    if "liquidity hub" in lowered and "base" in lowered:
+        return f"{subject} — хаб ликвидности для экосистемы Base."
+
+    if "automated market maker" in lowered and "base" in lowered:
+        return f"{subject} — автоматизированный маркет-мейкер в экосистеме Base."
+
+    if "decentralized exchange" in lowered and "base" in lowered:
+        return f"{subject} — децентрализованная биржа в экосистеме Base."
+
+    if "decentralized exchange" in lowered:
+        return f"{subject} — децентрализованная биржа."
+
+    if "spot exchange liquidity and routing for token trading" in lowered:
+        return f"{subject} предоставляет ликвидность и маршрутизацию для спотовой торговли токенами."
+
+    return None
+
+
+def _translate_official_blog_claim(text: str | None) -> str:
+    value = _normalize_mojibake_blog_text(_normalize_inline(text or ""))
+    if not value:
+        return value
+    value = _clean_official_blog_lead(value)
+    normalized = re.sub(
+        r"^[A-Z][A-Z\s.,&'/-]{6,}(?:March|April|May|June|July|August|September|October|November|December|January|February)\s+\d{1,2},\s+20\d{2}\s*/\s*PRNewswire\s*/\s*--\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"^[A-Z][A-Z\s.,&'/-]+/\s*PRNewswire\s*/\s*--\s*", "", normalized, flags=re.IGNORECASE)
+    if normalized != value:
+        value = normalized.strip(" -,:;")
+
+    match = re.match(
+        r"^(.+), the DeFi chain powered by Uniswap, has adopted the Chainlink data standard and joined the Chainlink Scale program to accelerate the growth of (.+)\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            f"{match.group(1)} — DeFi-сеть на базе Uniswap — внедрила стандарт данных Chainlink "
+            f"и присоединилась к программе Chainlink Scale, чтобы ускорить рост {_translate_blog_tail(match.group(2))}."
+        )[:500]
+
+    match = re.match(
+        r"^([A-Z]{2,10}) stakers delegate their tokens to validators who run the network\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return f"Стейкеры {match.group(1)} делегируют свои токены валидаторам, которые поддерживают работу сети."
+
+    match = re.match(
+        r"^Chainlink announced a CCIP update for cross-chain messaging and token transfers\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Chainlink объявил об обновлении CCIP для кроссчейн-сообщений и переводов токенов."
+
+    match = re.match(
+        r"^Morpho(?:'s|’s) growth tells the story: Morpho has grown from \$0 to \$?([0-9.]+B\+?) in total deposits in just two years, with major enterprise integrations driving much of that growth\.?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            f"Morpho сообщает о росте total deposits до ${match.group(1)} за два года; "
+            "значительную часть роста проект связывает с enterprise-интеграциями."
+        )
+
+    match = re.match(
+        r"^Morpho TBA: taking onchain lending beyond crypto Onchain lending now handles tens of billions in liquidity across thousands of active markets\.?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Morpho TBA позиционируется как шаг к расширению ончейн-кредитования за пределы crypto-native рынков."
+
+    match = re.match(
+        r"^Morpho TBA brings fixed-rate lending onchain\.?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Morpho TBA переносит fixed-rate lending в ончейн-формат."
+
+    match = re.match(
+        r"^The Morpho Association today announced that it has entered into a cooperation agreement .* with certain affiliates of Apollo Global Management, Inc\.?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Morpho Association объявила о cooperation agreement с отдельными affiliate-структурами Apollo Global Management."
+
+    match = re.match(
+        r"^Under the Agreement, Apollo or its affiliates may acquire MORPHO tokens through a combination of open-market purchases, OTC transactions, and other contractual arrangements, subject to an overall ownership cap of ([0-9,\s]+million MORPHO tokens) over a ([0-9-]+month) period.*$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            f"По условиям agreement Apollo или её affiliate-структуры могут приобретать MORPHO через open-market purchases, "
+            f"OTC-сделки и другие договорённости; общий лимит владения указан как {match.group(1)} за период {match.group(2)}."
+        )[:500]
+
+    match = re.match(
+        r"^Apollo and Morpho will be working together to support onchain lending markets on Morpho.?s protocol\.?$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Apollo и Morpho будут совместно поддерживать ончейн-рынки кредитования на протоколе Morpho."
+
+    match = re.match(
+        r"^By adopting the Chainlink data standard, (.+) enables builders to create secure, advanced DeFi applications with Data Feeds and Smart Value Recapture \(SVR\) now live on mainnet\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            f"Благодаря внедрению стандарта данных Chainlink, {match.group(1)} позволяет разработчикам "
+            "создавать безопасные продвинутые DeFi-приложения; Data Feeds и Smart Value Recapture (SVR) уже работают в mainnet."
+        )[:500]
+
+    match = re.match(
+        r"^The partnership integrates Chainlink as an infrastructure provider for blockchain services across (.+), including oracle services for stablecoins and tokenized assets\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Партнёрство интегрирует Chainlink как инфраструктурного провайдера блокчейн-сервисов "
+            f"в {_translate_blog_tail(match.group(1))}, включая oracle-услуги для стейблкоинов и токенизированных активов."
+        )[:500]
+
+    match = re.match(
+        r"^ADI Foundation, (.+) and Chainlink, (.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "ADI Foundation и Chainlink упоминаются как участники инфраструктурного партнёрства "
+            "вокруг ADI Chain и связанных сервисов для токенизированных активов."
+        )
+
+    match = re.match(
+        r"^(.+) introduces a designated Atomicity Zone, called the System Zone, which handles core functions often placed in the settlement layer on other blockchains: Native coin \(([A-Z]{2,10})\) circulation\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            f"{match.group(1)} вводит выделенную Atomicity Zone под названием System Zone, "
+            f"которая берёт на себя базовые функции, часто размещаемые на settlement-слое других блокчейнов, включая обращение нативной монеты {match.group(2)}."
+        )
+
+    match = re.match(
+        r"^The System Zone maintains ([A-Z]{2,10}) balances and processes \1 transfers\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return f"System Zone ведёт балансы {match.group(1)} и обрабатывает переводы {match.group(1)}."
+
+    match = re.match(
+        r"^According to a post from Ondo on Wednesday, the feeds are now being used on Euler, where users can post the tokenized equities as collateral to borrow stablecoins\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Согласно посту Ondo, опубликованному в среду, эти фиды теперь используются на Euler, "
+            "где пользователи могут использовать токенизированные акции как залог для займа стейблкоинов."
+        )
+
+    match = re.match(
+        r"^According to a post from Ondo on Wednesday, the feeds are now being used on Euler\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Согласно посту Ondo, опубликованному в среду, эти фиды теперь используются на Euler."
+
+    match = re.match(
+        r"^By pairing exchange-linked liquidity with onchain price feeds, the companies aim to enable broader use of tokenized stocks in lending and other structured products\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Комбинируя ликвидность, связанную с биржевой торговлей, с ончейн-ценовыми фидами, компании "
+            "хотят расширить использование токенизированных акций в кредитовании и других структурированных продуктах."
+        )
+
+    match = re.match(
+        r"^The announcement follows an October 2025 partnership between Ondo Finance and Chainlink, a blockchain oracle network launched in 2017, that designated Chainlink as the primary data provider for Ondo.?s tokenized stocks and ETFs\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Этот анонс следует за партнёрством Ondo Finance и Chainlink, объявленным в октябре 2025 года; "
+            "в его рамках Chainlink был выбран основным поставщиком данных для токенизированных акций и ETF от Ondo."
+        )
+
+    match = re.match(
+        r"^On Tuesday, Wemade announced that Chainlink will provide technical support for data integrity, infrastructure standards and tokenized asset use cases\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Во вторник Wemade объявила, что Chainlink предоставит техническую поддержку "
+            "для целостности данных, инфраструктурных стандартов и сценариев использования токенизированных активов."
+        )
+
+    match = re.match(
+        r"^Wemade said Chainlink.?s role will also focus on supporting standardization and enabling alliance members to leverage oracle services\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Wemade также сообщила, что роль Chainlink будет сосредоточена на поддержке стандартизации "
+            "и на том, чтобы участники альянса могли использовать oracle-услуги."
+        )
+
+    match = re.match(
+        r"^Cointelegraph reached out to Chainlink for comment on its future role in the consortium but had not received a response by publication\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            "Cointelegraph запросил у Chainlink комментарий о её будущей роли в консорциуме, "
+            "но на момент публикации ответа не получил."
+        )
+
+    match = re.match(
+        r"^Cointelegraph reached out to Chainlink for comment and had not received a response by publication\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return "Cointelegraph запросил у Chainlink комментарий, но на момент публикации ответа не получил."
+
+    match = re.match(
+        r"^(.+) has adopted the Chainlink data standard and joined the Chainlink Scale program to accelerate the growth of (.+)\.$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return (
+            f"{match.group(1)} внедрил стандарт данных Chainlink и присоединился к программе Chainlink Scale, "
+            f"чтобы ускорить рост {match.group(2)}."
+        )[:500]
+
+    if not _looks_english_only(value):
+        return _translate_generic_blog_sentence(value)[:500]
+
+    replacements = (
+        ("cross-chain messaging", "кроссчейн-сообщения"),
+        ("token transfers", "переводы токенов"),
+        ("oracle services", "oracle-услуги"),
+        ("tokenized assets", "токенизированные активы"),
+        ("stablecoins", "стейблкоины"),
+        ("data feeds", "Data Feeds"),
+        ("smart value recapture", "Smart Value Recapture"),
+        ("ecosystem", "экосистема"),
+        ("infrastructure provider", "инфраструктурный провайдер"),
+        ("blockchain services", "блокчейн-сервисы"),
+        ("joined the chainlink scale program", "присоединился к программе Chainlink Scale"),
+        ("adopted the chainlink data standard", "внедрил стандарт данных Chainlink"),
+        ("announced", "объявил"),
+        ("integrates", "интегрирует"),
+        ("partnership", "партнёрство"),
+        ("including", "включая"),
+    )
+    translated = value
+    for src, dst in replacements:
+        translated = re.sub(re.escape(src), dst, translated, flags=re.IGNORECASE)
+    translated = _translate_generic_blog_sentence(translated)
+    return translated[:500]
+
+
+def _clean_official_blog_lead(text: str) -> str:
+    value = _normalize_inline(text)
+    value = re.sub(r"^Back to Blog\s+", "", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"^.+?\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\s+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"^/?PRNewswire/?\s*--\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^Executive Summary\s+", "", value, flags=re.IGNORECASE)
+    return value.strip(" -,:;")
+
+
+def _translate_generic_blog_sentence(text: str) -> str:
+    value = _normalize_inline(text)
+    replacements = (
+        (r"\bThis document explains how\b", "Этот документ объясняет, как"),
+        (r"\bcreates value, captures revenue, and distributes that value to token holders\b", "создаёт ценность, захватывает выручку и распределяет эту ценность держателям токенов"),
+        (r"\bEarlier this week, we launched the new\b", "Ранее на этой неделе мы запустили новый"),
+        (r"\bEarlier this week, we launched\b", "Ранее на этой неделе мы запустили"),
+        (r"\bThe brain inside is called\b", "Внутренний модуль называется"),
+        (r"\basks a different question entirely:\b", "ставит совсем другой вопрос:"),
+        (r"\bhow should your capital be distributed across lending markets to maximize yield given your specific risk preferences\b", "как следует распределить капитал по рынкам кредитования, чтобы максимизировать доходность с учётом ваших конкретных риск-предпочтений"),
+        (r"\bEverything we built and learned from both has been unified into a single, rebuilt agent:\b", "Всё, что мы построили и чему научились в обоих направлениях, было объединено в единого, заново собранного агента:"),
+        (r"\bAnd it lives inside a new interface:\b", "И он работает внутри нового интерфейса:"),
+        (r"^At\b", "В"),
+        (r"\bwe call this paradigm:\b", "мы называем эту парадигму:"),
+        (r"\bToday, we are happy to announce that\b", "Сегодня мы рады объявить, что"),
+        (r"\bwhich are moving more than\b", "которые уже провели более"),
+        (r"\bof volume to date, are going institutional\b", "объёма на текущий момент, выходят в институциональный сегмент"),
+        (r"\bis designed to reward those who have demonstrated genuine commitment to our vision of transforming decentralized finance through autonomous agents\b", "создан, чтобы вознаградить тех, кто продемонстрировал реальную приверженность нашему видению трансформации децентрализованных финансов с помощью автономных агентов"),
+        (r"\bbuilds autonomous agents that manage DeFi positions on behalf of users\b", "создаёт автономных агентов, которые управляют DeFi-позициями от имени пользователей"),
+        (r"\bThe Value\b", "Ценность"),
+        (r"\bCreates\b", "создаёт"),
+        (r"What's happening\?", "Что происходит?"),
+        (r"\bThe Cognitive Labor Problem\b", "Проблема когнитивного труда"),
+        (r"\bThe fundamental limiting resource in finance is cognition itself\b", "Фундаментально ограниченным ресурсом в финансах является сама когнитивная способность"),
+        (r"\blaunched the new\b", "запустили новый"),
+        (r"\bThe result is a self-reinforcing flywheel where incentives, usage, and protocol value converge\b", "Результатом становится самоподдерживающийся маховик, в котором сходятся стимулы, использование и ценность протокола"),
+        (r"\bfulfilling \$([A-Z]{2,10})'s role as the coordinating layer of agentic finance\b", r"реализуя роль $\1 как координационного слоя agentic finance"),
+        (r"\bThis report is the first in a series unpacking the rationale behind\b", "Этот отчёт открывает серию материалов, объясняющих логику, стоящую за"),
+        (r"\bProtocols post basic incentive offers, while Giza agents independently test and interact with these protocols to verify real performance rather than relying on marketing claims\b", "Протоколы публикуют базовые incentive-оферы, а агенты Giza независимо тестируют и используют эти протоколы, чтобы проверять реальную эффективность, а не полагаться на маркетинговые заявления"),
+        (r"\bGiza agents then actively test these protocols to extract real APR performance, creating standardized APR \(sAPR\) through direct interaction\b", "Затем агенты Giza активно тестируют эти протоколы, чтобы извлекать реальную APR-доходность и формировать стандартизированный APR (sAPR) через прямое взаимодействие"),
+        (r"\bIn just 6 months, Giza Agents have moved more than \$1\.5B across on-chain markets\b", "Всего за 6 месяцев агенты Giza переместили более $1.5B по ончейн-рынкам"),
+        (r"\bA new financial species is emerging, born at the intersection of smart automation and hyper personalization\b", "Появляется новый финансовый вид, возникший на пересечении умной автоматизации и гиперперсонализации"),
+        (r"\bThe \$GIZA airdrop\b", "Airdrop $GIZA"),
+        (r"\bCommunity ecosystem Building\b", "Построение экосистемы сообщества"),
+        (r"\bTechnical Advancement\b", "Техническое развитие"),
+    )
+    for pattern, dst in replacements:
+        value = re.sub(pattern, dst, value, flags=re.IGNORECASE)
+    return value
+
+
+def _translate_blog_tail(text: str) -> str:
+    value = _normalize_mojibake_blog_text(_normalize_inline(text))
+    replacements = (
+        ("the Unichain ecosystem", "экосистемы Unichain"),
+        ("Unichain ecosystem", "экосистемы Unichain"),
+        ("ADI Chain's ecosystem", "экосистеме ADI Chain"),
+        ("the ecosystem", "экосистемы"),
+        ("ecosystem", "экосистемы"),
+        ("mainnet", "основной сети"),
+    )
+    for src, dst in replacements:
+        value = re.sub(re.escape(src), dst, value, flags=re.IGNORECASE)
+    return value
+
+
+def _render_official_blog_claim(text: str | None) -> str | None:
+    value = _normalize_mojibake_blog_text(_normalize_inline(text or ""))
+    if not value:
+        return None
+    lowered = value.lower()
+    blocked_tokens = (
+        "news in focus",
+        "all news releases",
+        "english-only news releases",
+        "news releases overview",
+        "multimedia gallery",
+        "trending topics",
+        "business & money",
+        "auto & transportation",
+        "products about blog",
+        "blog zero developers",
+        "table of contents",
+        "what is a blockchain",
+        "the technology underlying the",
+        "decentralization-first",
+        "true decentralization is only possible",
+        "the zero thesis",
+        "13 min read table of contents",
+        "company jobs blog support brand",
+        "copy as png copy as svg",
+        "products consumer vaults markets prime curate rewards infra api sdk",
+        "launch app launch app",
+    )
+    if any(token in lowered for token in blocked_tokens):
+        return None
+    translated = _translate_official_blog_claim(value)
+    translated_lower = translated.lower()
+    if any(token in translated_lower for token in blocked_tokens):
+        return None
+    return translated
+
+
+def _normalize_mojibake_blog_text(text: str) -> str:
+    value = _normalize_inline(text)
+    if not value:
+        return value
+    # Some scraped blog pages replace "at" with Cyrillic Ve inside otherwise Latin text.
+    value = re.sub(r"(?<=[A-Za-z])В(?=[A-Za-z'])", "at", value)
+    value = re.sub(r"(?<=[A-Za-z])в(?=[A-Za-z'])", "at", value)
+    value = re.sub(r"(?<=[A-Za-z])В(?=\s+[A-Za-z])", "at", value)
+    value = re.sub(r"(?<=[A-Za-z])в(?=\s+[A-Za-z])", "at", value)
+    value = value.replace("📚", "").replace("🐱", "")
+    return _normalize_inline(value)
+
+
+def _translate_project_type(text: str) -> str:
+    mapping = {
+        "lending": "лендинг",
+        "dex_spot": "спотовый DEX",
+        "dexspot": "спотовый DEX",
+        "dex_aggregator": "DEX aggregator",
+        "perp_dex": "перпетуальный DEX",
+        "synthetic_dollar": "протокол синтетического доллара",
+        "blockchain": "блокчейн",
+        "rwa": "rwa",
+        "bridge": "interoperability / cross-chain messaging",
+        "oracle": "оракул",
+        "data_infra": "инфраструктура данных",
+        "agent_platform": "AI-agent tokenization / commerce platform",
+        "depin_wireless": "DePIN / decentralized wireless network",
+        "liquid_staking": "liquid staking / restaking",
+        "asset_management": "asset management / vault strategies",
+        "nft_marketplace": "NFT marketplace",
+        "gaming": "gaming / GameFi",
+        "social": "SocialFi / creator network",
+        "prediction_market": "prediction market",
+        "meme": "meme / community token",
+        "ai_network": "AI infrastructure / AI network",
+        "vault_yield": "yield-хранилища",
+        "yield_trading": "yield / interest-rate trading",
+    }
+    return mapping.get(text, text)
+
+
+def _translate_project_subtype(text: str) -> str:
+    mapping = {
+        "cdp_lending": "cdp-lending",
+        "cdplending": "cdp-lending",
+        "amm_spot_dex": "AMM-спотовый DEX",
+        "ammspotdex": "AMM-спотовый DEX",
+        "orderbook_spot_dex": "orderbook-спотовый DEX",
+        "orderbookspotdex": "orderbook-спотовый DEX",
+        "orderbook_perp_dex": "orderbook-perp DEX",
+        "amm_perp_dex": "AMM-perp DEX",
+        "payments_tokenization_l1": "payment / asset-tokenization L1",
+    }
+    return mapping.get(text, text)
