@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from core.models import EvidenceBundle, EvidenceFact, ProjectDossier, ScoreDimension, Target
+from core.models import EvidenceBundle, EvidenceFact, ProjectDossier, ScoreDimension, SectionDocument, Target
 from core.report import build_report
 
 WEIGHTS: dict[str, dict[str, float]] = {
@@ -67,9 +67,11 @@ class MasterResearchAgent:
         baseline_results: list,
         market_intel: EvidenceBundle | None,
         analysis: dict | None = None,
+        sections: list[SectionDocument] | None = None,
         auxiliary_sources: dict | None = None,
     ) -> ProjectDossier:
         analysis = analysis or {}
+        sections = sections or []
         auxiliary_sources = auxiliary_sources or {}
         bundle = market_intel or EvidenceBundle(agent="market_intel_agent")
         profile = bundle.profile or "generic_token"
@@ -82,7 +84,7 @@ class MasterResearchAgent:
             auxiliary_sources=auxiliary_sources,
         )
         final_score = self._final_score(profile, dimension_scores)
-        citations = self._citations(bundle.facts)
+        citations = self._citations(bundle.facts, sections=sections)
         summary = analysis.get("take") or analysis.get("analysis") or ""
         markdown = self._build_markdown(
             target=target,
@@ -95,6 +97,7 @@ class MasterResearchAgent:
             missing_metrics=bundle.missing_metrics,
             conflicts=conflicts,
             facts=bundle.facts,
+            sections=sections,
         )
         return ProjectDossier(
             target_name=target.name,
@@ -109,9 +112,11 @@ class MasterResearchAgent:
                 **(bundle.coverage or {}),
                 "facts_count": len(bundle.facts),
                 "missing_metrics": bundle.missing_metrics,
+                "sections": {section.section_id: section.status for section in sections},
             },
             conflicts=conflicts,
             citations=citations,
+            sections=sections,
             metadata={"agent": "master_research_agent"},
         )
 
@@ -127,6 +132,7 @@ class MasterResearchAgent:
         missing_metrics: list[str],
         conflicts: list[dict[str, Any]],
         facts: list[EvidenceFact],
+        sections: list[SectionDocument],
     ) -> str:
         base_md = build_report(
             target,
@@ -179,6 +185,11 @@ class MasterResearchAgent:
                     line += f" {fact.unit}"
                 line += f" [{fact.source}]"
                 lines.append(line)
+        for section in sections:
+            if not section.markdown:
+                continue
+            lines.append("")
+            lines.append(section.markdown.strip())
         return "\n".join(lines).strip()
 
     def _compute_dimensions(
@@ -394,11 +405,16 @@ class MasterResearchAgent:
     def _clamp(self, value: float) -> float:
         return round(max(0.0, min(100.0, value)), 1)
 
-    def _citations(self, facts: list[EvidenceFact]) -> list[str]:
+    def _citations(self, facts: list[EvidenceFact], *, sections: list[SectionDocument] | None = None) -> list[str]:
         seen: set[str] = set()
         citations: list[str] = []
         for fact in facts:
             if fact.citation_url and fact.citation_url not in seen:
                 seen.add(fact.citation_url)
                 citations.append(fact.citation_url)
+        for section in sections or []:
+            for url in section.citations:
+                if url and url not in seen:
+                    seen.add(url)
+                    citations.append(url)
         return citations

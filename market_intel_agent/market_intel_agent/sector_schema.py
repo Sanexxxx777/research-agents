@@ -21,6 +21,13 @@ TARGET_SECTORS: Final[tuple[str, ...]] = (
     "oracles",
     "depin",
     "ai",
+    "dex_aggregators",
+    "asset_management",
+    "nft_marketplaces",
+    "gaming",
+    "social",
+    "prediction_markets",
+    "memes",
     "infrastructure",
 )
 
@@ -55,6 +62,13 @@ SECTOR_CLASSIFICATION_PRIORITY: Final[tuple[str, ...]] = (
     "bridges",
     "depin",
     "ai",
+    "dex_aggregators",
+    "asset_management",
+    "nft_marketplaces",
+    "gaming",
+    "social",
+    "prediction_markets",
+    "memes",
     "l1_l2",
     "infrastructure",
 )
@@ -71,6 +85,13 @@ SECTOR_CLASSIFICATION_KEYWORDS: Final[dict[str, tuple[str, ...]]] = {
     "oracles": ("oracle", "price feed", "data feed", "attestation", "data availability oracle"),
     "depin": ("depin", "decentralized physical infrastructure", "physical node", "wireless network", "storage network"),
     "ai": ("ai", "agent", "agents", "llm", "inference", "model", "gpu compute", "copilot"),
+    "dex_aggregators": ("dex aggregator", "aggregator", "routing", "smart order routing", "swap aggregator", "intent"),
+    "asset_management": ("asset management", "vault", "yield vault", "strategy", "portfolio", "index", "structured product"),
+    "nft_marketplaces": ("nft marketplace", "nft", "marketplace", "collectibles", "creator royalties"),
+    "gaming": ("gaming", "gamefi", "game", "metaverse", "play to earn", "play-to-earn"),
+    "social": ("social", "socialfi", "creator", "fan token", "community", "identity"),
+    "prediction_markets": ("prediction market", "prediction markets", "betting", "forecast", "outcome market", "sportsbook"),
+    "memes": ("meme", "memes", "memecoin", "community token"),
     "infrastructure": (
         "infrastructure",
         "infra",
@@ -653,11 +674,83 @@ SECTOR_SCHEMA: Final[dict[str, dict[str, dict[str, list[str]]]]] = {
     },
 }
 
+ALERTS_SECTOR_ALIASES: Final[dict[str, str]] = {
+    "layer 1": "l1_l2",
+    "layer 2": "l1_l2",
+    "dex": "dex_spot",
+    "dex aggregators": "dex_aggregators",
+    "derivatives": "perp_dex",
+    "lending": "defi_lending",
+    "liquid staking": "lst_lrt",
+    "stablecoins": "stablecoins",
+    "asset management": "asset_management",
+    "infrastructure": "infrastructure",
+    "oracles": "oracles",
+    "bridges": "bridges",
+    "depin": "depin",
+    "nft marketplaces": "nft_marketplaces",
+    "gaming": "gaming",
+    "social": "social",
+    "prediction markets": "prediction_markets",
+    "rwa": "rwa",
+    "memes": "memes",
+    "ai agents": "ai",
+}
+
+ALERTS_GENERIC_ONLY_SECTORS: Final[tuple[str, ...]] = (
+    "dex_aggregators",
+    "asset_management",
+    "nft_marketplaces",
+    "gaming",
+    "social",
+    "prediction_markets",
+    "memes",
+)
+
+
+def normalize_alerts_sector_name(name: str | None) -> str | None:
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+    return ALERTS_SECTOR_ALIASES.get(normalized) or normalized.replace(" ", "_")
+
+
+def _generic_alerts_sector_schema(sector: str) -> dict[str, dict[str, list[str]]]:
+    del sector
+    return {
+        "sector_metrics": {
+            "must": ["sector_mcap", "sector_avg_24h", "sector_avg_7d", "sector_avg_30d", "sector_token_count"],
+            "should": ["sector_best_token_change_24h", "sector_target_alpha_24h", "sector_peer_count"],
+            "optional_later": ["sector_rotation_score", "sector_liquidity_depth_usd", "sector_revenue_30d"],
+        },
+        "derived_metrics": {
+            "must": ["sector_target_alpha_24h"],
+            "should": ["sector_target_alpha_7d", "sector_target_alpha_30d"],
+            "optional_later": ["sector_relative_strength_score", "sector_beta_to_market"],
+        },
+        "competitor_comparison": {
+            "must": ["sector_mcap_rank", "sector_avg_24h_rank", "sector_avg_30d_rank"],
+            "should": ["sector_token_count_rank", "sector_best_token_rank"],
+            "optional_later": ["sector_liquidity_rank", "sector_revenue_rank"],
+        },
+        "gaps": {
+            "must": ["missing_deep_sector_fundamentals"],
+            "should": ["missing_sector_revenue_dataset", "missing_sector_user_activity_dataset"],
+            "optional_later": ["missing_sector_retention_dataset"],
+        },
+    }
+
+
+for _sector in ALERTS_GENERIC_ONLY_SECTORS:
+    SECTOR_SCHEMA.setdefault(_sector, _generic_alerts_sector_schema(_sector))
+
 IMPLEMENTATION_WAVES: Final[dict[str, list[str]]] = {
     "wave_1": ["defi_lending", "dex_spot", "perp_dex"],
     "wave_2": ["l1_l2", "stablecoins", "bridges"],
     "wave_3": ["lst_lrt", "rwa", "oracles", "depin"],
     "wave_4": ["ai", "infrastructure"],
+    "wave_5_alerts_generic": list(ALERTS_GENERIC_ONLY_SECTORS),
 }
 
 WAVE_RATIONALE: Final[dict[str, str]] = {
@@ -687,6 +780,13 @@ SECTOR_FAMILY_MAP: Final[dict[str, str]] = {
     "oracles": "infrastructure",
     "depin": "infrastructure",
     "ai": "ai",
+    "dex_aggregators": "defi",
+    "asset_management": "defi",
+    "nft_marketplaces": "consumer",
+    "gaming": "consumer",
+    "social": "consumer",
+    "prediction_markets": "consumer",
+    "memes": "community",
     "infrastructure": "infrastructure",
 }
 
@@ -707,6 +807,13 @@ SECTOR_COMPETITOR_LOGIC: Final[dict[str, str]] = {
     "oracles": "Rank by secured value, feed coverage, and update quality.",
     "depin": "Rank by node network scale, utilization, and revenue productivity.",
     "ai": "Rank by long-horizon AI revenue, inference demand, and growth durability.",
+    "dex_aggregators": "Rank by sector momentum, routing volume proxies, and peer-relative token performance until deep aggregator metrics are available.",
+    "asset_management": "Rank by sector momentum, TVL/AUM proxies, and peer-relative token performance until deep vault metrics are available.",
+    "nft_marketplaces": "Rank by sector momentum, marketplace volume proxies, and peer-relative token performance until deep NFT metrics are available.",
+    "gaming": "Rank by sector momentum, game ecosystem growth proxies, and peer-relative token performance until deep gaming metrics are available.",
+    "social": "Rank by sector momentum, user/community growth proxies, and peer-relative token performance until deep social metrics are available.",
+    "prediction_markets": "Rank by sector momentum, market volume proxies, and peer-relative token performance until deep prediction-market metrics are available.",
+    "memes": "Rank by sector momentum and peer-relative liquidity/market-cap behavior; fundamentals are intentionally limited.",
     "infrastructure": "Umbrella ranking via subprofile mapping first; fallback to infra-wide usage/revenue proxies.",
 }
 
@@ -722,6 +829,13 @@ SECTOR_LIKELY_SOURCE_FAMILIES: Final[dict[str, list[str]]] = {
     "oracles": ["defillama_fees_revenue", "defillama_oracles", "defillama_protocol", "coingecko", "hub_market_status"],
     "depin": ["project_telemetry", "coingecko", "defillama_protocol", "hub_market_status"],
     "ai": ["project_telemetry", "coingecko", "onchain_usage_feeds", "hub_market_status"],
+    "dex_aggregators": ["alerts_sector_map", "coingecko", "defillama_dexs", "hub_market_status"],
+    "asset_management": ["alerts_sector_map", "coingecko", "defillama_protocol", "hub_market_status"],
+    "nft_marketplaces": ["alerts_sector_map", "coingecko", "marketplace_apis", "hub_market_status"],
+    "gaming": ["alerts_sector_map", "coingecko", "project_telemetry", "hub_market_status"],
+    "social": ["alerts_sector_map", "coingecko", "project_telemetry", "hub_market_status"],
+    "prediction_markets": ["alerts_sector_map", "coingecko", "project_telemetry", "hub_market_status"],
+    "memes": ["alerts_sector_map", "coingecko", "hub_market_status"],
     "infrastructure": ["defillama_protocol", "defillama_chains", "coingecko", "hub_market_status"],
 }
 

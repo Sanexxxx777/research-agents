@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from market_intel_agent.sector_schema import (
     SECTOR_CLASSIFICATION_PRIORITY,
     matches_sector_keywords,
+    normalize_alerts_sector_name,
 )
 
 
@@ -17,8 +19,13 @@ class SectorResolver:
         target: dict[str, Any],
         market_status: dict[str, Any] | None,
         coingecko_payload: dict[str, Any] | None = None,
+        alerts_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         known_sectors = self._known_sectors_from_market_status(market_status or {})
+        alerts_known_sectors = self._known_sectors_from_alerts_payload(alerts_payload or {})
+        for sector in alerts_known_sectors:
+            if sector not in known_sectors:
+                known_sectors.append(sector)
         target_text = " ".join(
             [
                 str(target.get("category") or ""),
@@ -28,8 +35,12 @@ class SectorResolver:
         ).strip().lower()
 
         matched_sector = None
+        alerts_sector = self._sector_from_alerts_payload(target=target, alerts_payload=alerts_payload or {})
+        if alerts_sector:
+            matched_sector = alerts_sector
+
         for sector_name in known_sectors:
-            if sector_name and sector_name in target_text:
+            if not matched_sector and sector_name and sector_name in target_text:
                 matched_sector = sector_name
                 break
 
@@ -39,7 +50,7 @@ class SectorResolver:
         return {
             "sector": matched_sector,
             "known_sectors": known_sectors,
-            "resolution_source": "hub_market_status+heuristics",
+            "resolution_source": "alerts_sector+hub_market_status+heuristics" if alerts_sector else "hub_market_status+heuristics",
             "target_text": target_text,
         }
 
@@ -58,3 +69,42 @@ class SectorResolver:
             if matches_sector_keywords(text, candidate):
                 return candidate
         return "generic_token"
+
+    def _known_sectors_from_alerts_payload(self, alerts_payload: dict[str, Any]) -> list[str]:
+        sectors = alerts_payload.get("known_sectors")
+        if not sectors and isinstance(alerts_payload.get("sectors"), dict):
+            sectors = list((alerts_payload.get("sectors") or {}).keys())
+        names: list[str] = []
+        for raw in sectors or []:
+            normalized = normalize_alerts_sector_name(str(raw))
+            if normalized and normalized not in names:
+                names.append(normalized)
+        return names
+
+    def _sector_from_alerts_payload(self, *, target: dict[str, Any], alerts_payload: dict[str, Any]) -> str | None:
+        normalized = str(alerts_payload.get("normalized_sector") or "").strip().lower()
+        if normalized:
+            return normalized
+        sector_block = alerts_payload.get("sector_block") or {}
+        normalized = str((sector_block or {}).get("sector") or "").strip().lower()
+        if normalized:
+            return normalized
+        sector_tokens = alerts_payload.get("sectorTokens") or {}
+        if not isinstance(sector_tokens, dict):
+            return None
+        identifiers = {
+            str(target.get("coingecko_id") or "").strip().lower(),
+            str(target.get("id") or "").strip().lower(),
+            str(target.get("ticker") or "").strip().lower(),
+            str(target.get("name") or "").strip().lower(),
+        }
+        identifiers = {item for item in identifiers if item}
+        for item in list(identifiers):
+            slug = "-".join(part for part in re.split(r"[^a-z0-9]+", item.lower()) if part)
+            if slug:
+                identifiers.add(slug)
+        for display_name, tokens in sector_tokens.items():
+            token_ids = {str(item or "").strip().lower() for item in (tokens or []) if str(item or "").strip()}
+            if identifiers & token_ids:
+                return normalize_alerts_sector_name(str(display_name))
+        return None

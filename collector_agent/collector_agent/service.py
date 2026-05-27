@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable
+from typing import Callable
 
 import httpx
 from loguru import logger
@@ -34,8 +34,6 @@ class CollectorAgentService:
     async def collect(self, request: CollectorRequest) -> CollectorResponse:
         deadline_at = time.monotonic() + request.deadline_sec
         requested_sources = list(request.sources)
-        non_dune_sources = [source for source in requested_sources if source != "dune"]
-        dune_requested = "dune" in requested_sources
 
         async with self.client_factory() as client:
             project_profile = await self._build_project_profile(
@@ -46,7 +44,7 @@ class CollectorAgentService:
 
             results_by_source: dict[str, SourceResult] = {}
 
-            if non_dune_sources:
+            if requested_sources:
                 tasks = [
                     self._collect_one(
                         source_name=source_name,
@@ -54,31 +52,11 @@ class CollectorAgentService:
                         client=client,
                         deadline_at=deadline_at,
                     )
-                    for source_name in non_dune_sources
+                    for source_name in requested_sources
                 ]
                 base_results = await asyncio.gather(*tasks)
                 for result in base_results:
                     results_by_source[result.source] = result
-
-            if dune_requested:
-                prelim_results = [results_by_source[name] for name in non_dune_sources if name in results_by_source]
-                prelim_diagnostics = build_agent_diagnostics(
-                    request,
-                    prelim_results,
-                    project_profile=project_profile,
-                )
-                dune_gap_metrics = self._dune_gap_metrics(prelim_diagnostics)
-                dune_asset_type = str(prelim_diagnostics.get("asset_type") or "unknown_other")
-
-                dune_result = await self._collect_one(
-                    source_name="dune",
-                    request=request,
-                    client=client,
-                    deadline_at=deadline_at,
-                    dune_gap_metrics=dune_gap_metrics,
-                    dune_asset_type=dune_asset_type,
-                )
-                results_by_source["dune"] = dune_result
 
             results = [results_by_source[name] for name in requested_sources if name in results_by_source]
 
@@ -94,6 +72,23 @@ class CollectorAgentService:
             status = "error"
 
         diagnostics = build_agent_diagnostics(request, results, project_profile=project_profile)
+        diagnostics.pop("unavailable_until_dune", None)
+        by_metric = diagnostics.get("by_metric")
+        if isinstance(by_metric, dict):
+            for row in by_metric.values():
+                if not isinstance(row, dict):
+                    continue
+                if row.get("status") == "unavailable_until_dune":
+                    row["status"] = "not_found"
+                preferred = row.get("preferred_sources")
+                if isinstance(preferred, list):
+                    row["preferred_sources"] = [src for src in preferred if "dune" not in str(src).lower()]
+                attempted = row.get("attempted_sources")
+                if isinstance(attempted, list):
+                    row["attempted_sources"] = [src for src in attempted if "dune" not in str(src).lower()]
+                future = row.get("future_sources")
+                if isinstance(future, list):
+                    row["future_sources"] = [src for src in future if "dune" not in str(src).lower()]
         return CollectorResponse(
             status=status,
             target=request.target,
@@ -102,26 +97,6 @@ class CollectorAgentService:
             errors=[error for error in top_errors if isinstance(error, CollectorError)],
             diagnostics=diagnostics,
         )
-
-    def _dune_gap_metrics(self, diagnostics: dict[str, Any]) -> list[str]:
-        by_metric = diagnostics.get("by_metric")
-        if not isinstance(by_metric, dict):
-            return []
-
-        gaps: list[str] = []
-        for metric, row in by_metric.items():
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or "").strip().lower()
-            if status == "found":
-                continue
-            preferred = [str(item).strip().lower() for item in (row.get("preferred_sources") or [])]
-            attempted = [str(item).strip().lower() for item in (row.get("attempted_sources") or [])]
-            future = [str(item).strip().lower() for item in (row.get("future_sources") or [])]
-            all_sources = preferred + attempted + future
-            if any("dune" in source for source in all_sources):
-                gaps.append(str(metric))
-        return sorted(dict.fromkeys(gaps))
 
     async def _build_project_profile(
         self,
@@ -152,8 +127,6 @@ class CollectorAgentService:
         request: CollectorRequest,
         client: httpx.AsyncClient,
         deadline_at: float,
-        dune_gap_metrics: list[str] | None = None,
-        dune_asset_type: str | None = None,
     ) -> SourceResult:
         adapter = self.adapters[source_name]
         start = time.perf_counter()
@@ -171,22 +144,10 @@ class CollectorAgentService:
             )
 
         try:
-            if source_name == "dune":
-                result = await asyncio.wait_for(
-                    adapter.collect(
-                        request,
-                        client=client,
-                        deadline_at=deadline_at,
-                        gap_metrics=dune_gap_metrics or [],
-                        asset_type=dune_asset_type or "unknown_other",
-                    ),
-                    timeout=remaining,
-                )
-            else:
-                result = await asyncio.wait_for(
-                    adapter.collect(request, client=client, deadline_at=deadline_at),
-                    timeout=remaining,
-                )
+            result = await asyncio.wait_for(
+                adapter.collect(request, client=client, deadline_at=deadline_at),
+                timeout=remaining,
+            )
         except asyncio.TimeoutError:
             result = failed_source_result(
                 source=source_name,

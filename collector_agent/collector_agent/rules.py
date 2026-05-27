@@ -330,27 +330,46 @@ _DEFILLAMA_CATEGORY_MAP = {
     "data": "infrastructure_or_oracle_or_data",
     "bridge": "infrastructure_or_oracle_or_data",
     "bridges": "infrastructure_or_oracle_or_data",
+    "agent": "infrastructure_or_oracle_or_data",
+    "agents": "infrastructure_or_oracle_or_data",
+    "agent platform": "infrastructure_or_oracle_or_data",
+    "agent tokenization": "infrastructure_or_oracle_or_data",
+    "depin": "infrastructure_or_oracle_or_data",
+    "wireless": "infrastructure_or_oracle_or_data",
+    "depin wireless": "infrastructure_or_oracle_or_data",
 }
 
 _KEYWORD_HINTS: dict[AssetType, tuple[str, ...]] = {
     "lending": ("lending", "lend", "borrow", "loan", "credit", "cdp"),
     "blockchain": ("chain", "layer 1", "layer1", "layer 2", "layer2", "blockchain", "network"),
-    "dex": ("dex", "exchange", "amm", "swap"),
+    "dex": ("dex", "exchange", "amm", "swap", "aggregator", "routing"),
     "perp_dex": ("perp", "perpetual", "derivative", "futures"),
     "rwa": ("rwa", "real world asset", "treasury", "credit fund", "bond"),
-    "infrastructure_or_oracle_or_data": ("oracle", "data", "infrastructure", "bridge", "interoperability", "indexing"),
+    "infrastructure_or_oracle_or_data": ("oracle", "data", "infrastructure", "bridge", "interoperability", "indexing", "agent", "tokenization", "depin", "wireless", "ai", "inference", "compute"),
     "unknown_other": (),
 }
 _PROFILE_TYPE_TO_ASSET: dict[str, AssetType] = {
     "lending": "lending",
     "blockchain": "blockchain",
     "dex_spot": "dex",
+    "dex_aggregator": "dex",
     "perp_dex": "perp_dex",
     "rwa": "rwa",
     "bridge": "infrastructure_or_oracle_or_data",
     "oracle": "infrastructure_or_oracle_or_data",
+    "agent_platform": "infrastructure_or_oracle_or_data",
+    "depin_wireless": "infrastructure_or_oracle_or_data",
+    "liquid_staking": "unknown_other",
+    "asset_management": "unknown_other",
+    "nft_marketplace": "unknown_other",
+    "gaming": "unknown_other",
+    "social": "unknown_other",
+    "prediction_market": "unknown_other",
+    "meme": "unknown_other",
+    "ai_network": "infrastructure_or_oracle_or_data",
     "data_infra": "infrastructure_or_oracle_or_data",
     "vault_yield": "unknown_other",
+    "yield_trading": "dex",
 }
 
 

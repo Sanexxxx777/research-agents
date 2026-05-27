@@ -1,0 +1,9 @@
+{
+  "mcp_mode": "bridge",
+  "mcp_reason": "openclaw_cli_not_found",
+  "openclaw_bin": "",
+  "target_agent_id": "market-intel-agent",
+  "switch_default_agent": "1",
+  "restore_default_agent": "0",
+  "skills_required": ["protocol-deep-dive", "market-analysis", "risk-assessment"]
+}

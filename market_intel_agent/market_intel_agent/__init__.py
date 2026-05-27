@@ -1,4 +1,5 @@
 from market_intel_agent.service import MarketIntelAgent
+from market_intel_agent.project_analysis import ProjectAnalysisPipeline
 from market_intel_agent.sector_schema import (
     FIRST_FULL_IMPLEMENTATION_TARGET,
     FUNDAMENTAL_HORIZONS,
@@ -13,6 +14,7 @@ from market_intel_agent.sector_schema import (
 
 __all__ = [
     "MarketIntelAgent",
+    "ProjectAnalysisPipeline",
     "TARGET_SECTORS",
     "UNIVERSAL_BASE_SCHEMA",
     "SECTOR_SCHEMA",

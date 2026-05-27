@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
-SourceName = Literal["coingecko", "defillama", "dune"]
+SourceName = Literal["coingecko", "defillama"]
 MethodName = Literal["api", "browser"]
 StrategyName = Literal["api_first_browser_second"]
 QualityStatus = Literal["complete", "fallback", "warnings"]

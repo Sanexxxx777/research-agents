@@ -11,7 +11,7 @@ Scope:
 - no direct writes into RH DB
 - no queue/event bus
 - no browser automation framework in v1
-- `dune` works as read-only gap filler (after CoinGecko/DefiLlama diagnostics)
+- no Dune ownership (Dune collection moved to `market_intel_agent`)
 
 ## Run
 
@@ -26,11 +26,6 @@ Env vars:
 - `COLLECTOR_HTTP_TIMEOUT_SECONDS` — per-upstream request cap, default `10`
 - `COINGECKO_BASE_URL` — default `https://api.coingecko.com/api/v3`
 - `DEFILLAMA_BASE_URL` — default `https://api.llama.fi`
-- `COLLECTOR_DUNE_API_KEY` — Dune API key for query execution
-- `COLLECTOR_DUNE_BASE_URL` — default `https://api.dune.com/api/v1`
-- `COLLECTOR_DUNE_QUERY_IDS` — JSON map of profile→query_id, e.g. `{"perp_dex":123,"lending":456,"blockchain":789,"rwa":1011,"default":111}`
-- `COLLECTOR_DUNE_QUERY_TIMEOUT_SECONDS` — execution polling cap, default `25`
-- `COLLECTOR_DUNE_POLL_INTERVAL_SECONDS` — status poll interval, default `2`
 
 Auth behavior:
 - if `COLLECTOR_SERVICE_TOKEN` is set, inbound `X-Service-Token` must match
@@ -42,7 +37,7 @@ Auth behavior:
 
 Request body:
 - `target: { name, ticker?, coingecko_id? }`
-- `sources: ["coingecko", "defillama", "dune"]`
+- `sources: ["coingecko", "defillama"]`
 - `criteria: { need_metrics, need_protocol, need_yields?, need_competitors? }`
 - `strategy: "api_first_browser_second"`
 - `deadline_sec: number`
@@ -59,4 +54,4 @@ Notes:
 - `items[]` are RH-compatible normalized items
 - `partial` is returned when at least one source is usable and at least one source fails or times out
 - `browser-second` stays in the contract, but browser fallback is not implemented in v1
-- when `dune` is requested, service executes in order: non-dune sources first, then `dune` only for unresolved metric gaps
+- Dune is handled by `market_intel_agent`, not by `collector_agent`

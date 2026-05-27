@@ -49,16 +49,20 @@ except Exception:
         metadata: dict[str, Any] = field(default_factory=dict)
 from market_intel_agent.config import (
     HUB_SERVICE_TOKEN,
+    PROJECT_ANALYSIS_CONFIG,
+    PROJECT_ANALYSIS_ENABLED,
     PROFILE_GENERIC_TOKEN,
     PROFILE_REQUIRED_METRICS,
 )
 from market_intel_agent.contracts import SourceFetchResult
 from market_intel_agent.hub_client import HubClient
 from market_intel_agent.hub_writer import HubWriter
+from market_intel_agent.project_analysis.cache import Cache as ProjectAnalysisCache
+from market_intel_agent.project_analysis.pipeline import ProjectAnalysisPipeline
 from market_intel_agent.profile_selector import ProfileSelector
 from market_intel_agent.sector_resolver import SectorResolver
 from market_intel_agent.source_planner import SourcePlanner
-from market_intel_agent.sources import CoinGeckoSource, DefiLlamaSource, HubMarketStatusSource
+from market_intel_agent.sources import AlertsSectorSource, CoinGeckoSource, DefiLlamaSource, HubMarketStatusSource
 from market_intel_agent.target_resolver import TargetResolver
 
 
@@ -80,8 +84,19 @@ class MarketIntelAgent:
         self.hub_writer = HubWriter(self.hub_client)
 
         self.hub_market_source = HubMarketStatusSource(self.hub_client)
+        self.alerts_sector_source = AlertsSectorSource()
         self.coingecko_source = CoinGeckoSource()
         self.defillama_source = DefiLlamaSource()
+        self.project_analysis_cache = ProjectAnalysisCache()
+        self.project_analysis_pipeline = (
+            ProjectAnalysisPipeline(
+                config=PROJECT_ANALYSIS_CONFIG,
+                cache=self.project_analysis_cache,
+                queries=None,
+            )
+            if PROJECT_ANALYSIS_ENABLED
+            else None
+        )
 
     def availability(self) -> tuple[bool, str]:
         if not HUB_SERVICE_TOKEN:
@@ -99,18 +114,23 @@ class MarketIntelAgent:
         """Main v1 entrypoint: resolve target, collect market intel, persist to Hub."""
         resolved_target = await self.target_resolver.resolve(query=query, target_id=target_id)
         target = asdict(resolved_target)
+        project_analysis = await self.run_project_analysis(query or target.get("name") or "")
 
         market_status_result = await self._safe_collect_hub_market_status()
         coingecko_result = await self._safe_collect_coingecko(target)
+        alerts_sector_result = await self._safe_collect_alerts_sector(target)
         sector_resolution = self.sector_resolver.resolve(
             target=target,
             market_status=market_status_result.raw_payload,
             coingecko_payload=coingecko_result.raw_payload,
+            alerts_payload=alerts_sector_result.raw_payload,
         )
         profile = self.profile_selector.select(target=target, sector_resolution=sector_resolution)
         source_plan = self.source_planner.build(profile)
 
         source_results: list[SourceFetchResult] = [market_status_result]
+        if "alerts_sector" in source_plan.allowed_sources:
+            source_results.append(alerts_sector_result)
         if "coingecko" in source_plan.allowed_sources:
             source_results.append(coingecko_result)
         defillama_result: SourceFetchResult | None = None
@@ -131,10 +151,13 @@ class MarketIntelAgent:
                 or (defillama_result.raw_payload or {}).get("dex_block")
                 or (defillama_result.raw_payload or {}).get("l1_l2_block")
                 or (defillama_result.raw_payload or {}).get("perp_block")
+                or (defillama_result.raw_payload or {}).get("oracle_block")
             )
             if defillama_result
             else None
         )
+        if sector_block is None:
+            sector_block = (alerts_sector_result.raw_payload or {}).get("sector_block")
         sector_gaps = list((sector_block or {}).get("gaps") or [])
 
         created_run_id = await self.hub_writer.ensure_run(
@@ -193,7 +216,18 @@ class MarketIntelAgent:
                 "artifacts": artifact_result,
                 "snapshot": snapshot_result,
             },
+            "project_analysis": project_analysis,
         }
+
+    async def run_project_analysis(self, asset_input: str) -> dict[str, Any] | None:
+        text = str(asset_input or "").strip()
+        if not text or self.project_analysis_pipeline is None:
+            return None
+        try:
+            return await self.project_analysis_pipeline.run(text)
+        except Exception as exc:
+            logger.warning(f"[market_intel] project analysis failed: {exc}")
+            return None
 
     async def collect_market_intel(
         self,
@@ -212,15 +246,20 @@ class MarketIntelAgent:
         }
         market_status_result = await self._safe_collect_hub_market_status()
         coingecko_result = await self._safe_collect_coingecko(target_dict)
+        alerts_sector_result = await self._safe_collect_alerts_sector(target_dict)
         sector_resolution = self.sector_resolver.resolve(
             target=target_dict,
             market_status=market_status_result.raw_payload,
             coingecko_payload=coingecko_result.raw_payload,
+            alerts_payload=alerts_sector_result.raw_payload,
         )
         profile = self.profile_selector.select(target=target_dict, sector_resolution=sector_resolution)
         source_plan = self.source_planner.build(profile)
 
-        source_results: list[SourceFetchResult] = [market_status_result, coingecko_result]
+        source_results: list[SourceFetchResult] = [market_status_result]
+        if "alerts_sector" in source_plan.allowed_sources:
+            source_results.append(alerts_sector_result)
+        source_results.append(coingecko_result)
         defillama_result: SourceFetchResult | None = None
         if "defillama" in source_plan.allowed_sources:
             defillama_result = await self._safe_collect_defillama(target_dict)
@@ -236,10 +275,13 @@ class MarketIntelAgent:
                 or (defillama_result.raw_payload or {}).get("dex_block")
                 or (defillama_result.raw_payload or {}).get("l1_l2_block")
                 or (defillama_result.raw_payload or {}).get("perp_block")
+                or (defillama_result.raw_payload or {}).get("oracle_block")
             )
             if defillama_result
             else None
         )
+        if sector_block is None:
+            sector_block = (alerts_sector_result.raw_payload or {}).get("sector_block")
 
         return EvidenceBundle(
             agent="market_intel_agent",
@@ -278,6 +320,17 @@ class MarketIntelAgent:
             logger.warning(f"[market_intel] coingecko failed: {exc}")
             return SourceFetchResult(
                 source="coingecko",
+                status="error",
+                note=str(exc),
+            )
+
+    async def _safe_collect_alerts_sector(self, target: dict[str, Any]) -> SourceFetchResult:
+        try:
+            return await self.alerts_sector_source.collect(target)
+        except Exception as exc:
+            logger.warning(f"[market_intel] alerts_sector failed: {exc}")
+            return SourceFetchResult(
+                source="alerts_sector",
                 status="error",
                 note=str(exc),
             )
@@ -440,6 +493,14 @@ class MarketIntelAgent:
             "price_change_24h": ("%", "24h"),
             "price_change_7d": ("%", "7d"),
             "annualized_fees": ("USD", "annualized"),
+            "sector_mcap": ("USD", None),
+            "sector_avg_24h": ("%", "24h"),
+            "sector_avg_7d": ("%", "7d"),
+            "sector_avg_30d": ("%", "30d"),
+            "sector_token_count": ("count", None),
+            "sector_best_token_change_24h": ("%", "24h"),
+            "sector_target_alpha_24h": ("pp", "24h"),
+            "sector_peer_count": ("count", None),
         }
         return mapping.get(key, (None, None))
 

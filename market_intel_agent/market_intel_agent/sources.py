@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import httpx
 
-from market_intel_agent.config import COINGECKO_BASE_URL, DEFILLAMA_BASE_URL, HTTP_TIMEOUT_SECONDS
+from market_intel_agent.config import (
+    ALERTS_SECTOR_API_KEY,
+    ALERTS_SECTOR_API_URL,
+    COINGECKO_BASE_URL,
+    DEFILLAMA_BASE_URL,
+    HTTP_TIMEOUT_SECONDS,
+)
 from market_intel_agent.contracts import SourceFetchResult
 from market_intel_agent.hub_client import HubClient
-from market_intel_agent.sector_schema import SECTOR_SCHEMA
+from market_intel_agent.sector_schema import SECTOR_SCHEMA, normalize_alerts_sector_name
 
 LENDING_SCHEMA = SECTOR_SCHEMA["defi_lending"]
 LENDING_SECTOR_METRICS = LENDING_SCHEMA["sector_metrics"]
@@ -40,6 +47,87 @@ def _safe_float(value: Any) -> float | None:
     return None
 
 
+def _target_identifiers(target: dict[str, Any]) -> set[str]:
+    values = {
+        str(target.get("coingecko_id") or ""),
+        str(target.get("id") or ""),
+        str(target.get("symbol") or ""),
+        str(target.get("ticker") or ""),
+        str(target.get("name") or ""),
+    }
+    identifiers = {item.strip().lower() for item in values if item.strip()}
+    for item in list(identifiers):
+        slug = "-".join(part for part in re.split(r"[^a-z0-9]+", item.lower()) if part)
+        if slug:
+            identifiers.add(slug)
+    return identifiers
+
+
+def _find_alerts_sector_for_target(payload: dict[str, Any], target: dict[str, Any]) -> tuple[str | None, str | None]:
+    identifiers = _target_identifiers(target)
+    sector_tokens = payload.get("sectorTokens") or {}
+    if not isinstance(sector_tokens, dict):
+        return None, None
+    for display_name, tokens in sector_tokens.items():
+        token_ids = {str(item or "").strip().lower() for item in (tokens or []) if str(item or "").strip()}
+        if identifiers & token_ids:
+            return str(display_name), normalize_alerts_sector_name(str(display_name))
+    return None, None
+
+
+def _build_alerts_sector_block(payload: dict[str, Any], target: dict[str, Any]) -> dict[str, Any] | None:
+    display_name, normalized_name = _find_alerts_sector_for_target(payload, target)
+    if not display_name or not normalized_name:
+        return None
+    sectors = payload.get("sectors") or {}
+    sector_row = sectors.get(display_name) if isinstance(sectors, dict) else None
+    if not isinstance(sector_row, dict):
+        return None
+    sector_tokens = payload.get("sectorTokens") or {}
+    peers = list((sector_tokens.get(display_name) if isinstance(sector_tokens, dict) else None) or [])
+    token_id = str(target.get("coingecko_id") or target.get("id") or "").strip().lower()
+    token_row = (payload.get("data") or {}).get(token_id) if token_id else None
+    token_change_24h = _safe_float((token_row or {}).get("change_24h")) if isinstance(token_row, dict) else None
+    sector_avg_24h = _safe_float(sector_row.get("avg24h"))
+    target_alpha_24h = (
+        token_change_24h - sector_avg_24h
+        if token_change_24h is not None and sector_avg_24h is not None
+        else None
+    )
+    metrics = {
+        "sector_mcap": _safe_float(sector_row.get("mcap")),
+        "sector_avg_24h": sector_avg_24h,
+        "sector_avg_7d": _safe_float(sector_row.get("avg7d")),
+        "sector_avg_30d": _safe_float(sector_row.get("avg30d")),
+        "sector_token_count": _safe_float(sector_row.get("tokenCount")),
+        "sector_best_token_change_24h": _safe_float((sector_row.get("best") or {}).get("value")) if isinstance(sector_row.get("best"), dict) else None,
+        "sector_target_alpha_24h": target_alpha_24h,
+        "sector_peer_count": float(len(peers)) if peers else None,
+    }
+    metrics = {key: value for key, value in metrics.items() if value is not None}
+    return {
+        "sector": normalized_name,
+        "source_sector": display_name,
+        "sector_metrics": {"must": metrics, "should": {}, "optional_later": {}},
+        "derived_metrics": {
+            "must": {"sector_target_alpha_24h": target_alpha_24h} if target_alpha_24h is not None else {},
+            "should": {},
+            "optional_later": {},
+        },
+        "competitor_comparison": {"must": {}, "should": {}, "optional_later": {}},
+        "peers": peers,
+        "target_token": token_row if isinstance(token_row, dict) else None,
+        "gaps": [
+            {
+                "group": "gaps",
+                "tier": "must",
+                "metric": "missing_deep_sector_fundamentals",
+                "reason": "Alerts sector map provides market momentum coverage; deep sector fundamentals need dedicated source adapters.",
+            }
+        ],
+    }
+
+
 class HubMarketStatusSource:
     def __init__(self, hub_client: HubClient) -> None:
         self.hub_client = hub_client
@@ -57,6 +145,67 @@ class HubMarketStatusSource:
             citation_url=None,
             status="ok",
             note="Internal market regime overview from Hub",
+        )
+
+
+class AlertsSectorSource:
+    def __init__(
+        self,
+        *,
+        base_url: str = ALERTS_SECTOR_API_URL,
+        api_key: str = ALERTS_SECTOR_API_KEY,
+        timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    async def collect(self, target: dict[str, Any]) -> SourceFetchResult:
+        params = {"key": self.api_key} if self.api_key else {}
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.get(self.base_url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+
+        if not payload.get("success"):
+            return SourceFetchResult(
+                source="alerts_sector",
+                status="partial",
+                raw_payload=payload if isinstance(payload, dict) else {},
+                citation_url=self.base_url,
+                note="Alerts sector API returned an unsuccessful payload",
+            )
+
+        sector_block = _build_alerts_sector_block(payload, target)
+        if sector_block is None:
+            return SourceFetchResult(
+                source="alerts_sector",
+                status="partial",
+                raw_payload={
+                    "known_sectors": list((payload.get("sectors") or {}).keys()) if isinstance(payload.get("sectors"), dict) else [],
+                    "token_count": payload.get("tokenCount"),
+                    "timestamp": payload.get("timestamp"),
+                },
+                citation_url=self.base_url,
+                note="Target was not found in Alerts sector map",
+            )
+
+        metrics = dict((sector_block.get("sector_metrics") or {}).get("must") or {})
+        raw_payload = {
+            "sector_block": sector_block,
+            "alerts_sector": sector_block.get("source_sector"),
+            "normalized_sector": sector_block.get("sector"),
+            "known_sectors": list((payload.get("sectors") or {}).keys()) if isinstance(payload.get("sectors"), dict) else [],
+            "token_count": payload.get("tokenCount"),
+            "timestamp": payload.get("timestamp"),
+        }
+        return SourceFetchResult(
+            source="alerts_sector",
+            metrics=metrics,
+            raw_payload=raw_payload,
+            citation_url=self.base_url,
+            status="ok",
+            note="Sector momentum metrics from AlertsBot sector map",
         )
 
 
