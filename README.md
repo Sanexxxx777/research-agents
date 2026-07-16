@@ -2,7 +2,7 @@
 
 Extension agents for [Hub Research](https://github.com/Sanexxxx777/hub-research) — a set of specialized, constrained runtimes that plug into the main research pipeline via hot-reloadable adapters, each scoped to one narrow job (market metrics, official-source knowledge, scorecard assembly, external data collection) instead of one monolithic agent doing everything.
 
-Written by [Aleksandr Shulgin](https://github.com/Sanexxxx777) during a DeFi investment-consulting engagement, where these agents supported due-diligence research on crypto/DeFi protocols.
+Written by [Aleksandr Shulgin](https://github.com/Sanexxxx777) (@Aleksandr_NFA) during a DeFi investment-consulting engagement, where these agents supported due-diligence research on crypto/DeFi protocols.
 
 **Stack:** Python, FastAPI/HTTP services, Pydantic v2, CoinGecko/DeFiLlama/Dune APIs, systemd/uvicorn.
 
