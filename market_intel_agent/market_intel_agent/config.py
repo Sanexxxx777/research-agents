@@ -52,7 +52,7 @@ ALERTS_SECTOR_API_URL = os.getenv(
     "MARKET_INTEL_ALERTS_SECTOR_API_URL",
     "https://sectormap.dpdns.org/api/sheets",
 ).rstrip("/")
-ALERTS_SECTOR_API_KEY = os.getenv("MARKET_INTEL_ALERTS_SECTOR_API_KEY", "crypto-dashboard-2024").strip()
+ALERTS_SECTOR_API_KEY = os.getenv("MARKET_INTEL_ALERTS_SECTOR_API_KEY", "").strip()
 
 TARGET_ID_SEARCH_LIMIT = int(os.getenv("MARKET_INTEL_TARGET_ID_SEARCH_LIMIT", "500"))
 HTTP_TIMEOUT_SECONDS = float(os.getenv("MARKET_INTEL_HTTP_TIMEOUT_SECONDS", "20"))
