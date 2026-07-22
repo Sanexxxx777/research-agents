@@ -1,5 +1,7 @@
 # Research Agents
 
+<!-- TODO: demo GIF (20-40s) -->
+
 Extension agents for [Hub Research](https://github.com/Sanexxxx777/hub-research) — a set of specialized, constrained runtimes that plug into the main research pipeline via hot-reloadable adapters, each scoped to one narrow job (market metrics, official-source knowledge, scorecard assembly, external data collection) instead of one monolithic agent doing everything.
 
 Written by [Aleksandr Shulgin](https://github.com/Sanexxxx777) (@Aleksandr_NFA) during a DeFi investment-consulting engagement, where these agents supported due-diligence research on crypto/DeFi protocols.
@@ -23,3 +25,18 @@ Core modules:
 - `profile_selector.py` — choose profile (`generic_token`, `defi_lending`, `dex_spot`)
 - `source_planner.py` — constrained source + metric plan per profile
 - `hub_writer.py` — write observations/artifacts/snapshot into Hub analysis runs
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## На русском (кратко)
+
+Расширяющие агенты для [Hub Research](https://github.com/Sanexxxx777/hub-research) — набора
+специализированных runtime-компонентов, подключаемых к основному research-пайплайну через
+hot-reload адаптеры, каждый заточен под одну узкую задачу (рыночные метрики, официальные
+источники знаний, сборка scorecard, внешний сбор данных) вместо одного монолитного агента.
+Написаны во время консалтингового due-diligence проекта по крипто/DeFi протоколам. Стек: Python,
+FastAPI/HTTP-сервисы, Pydantic v2, CoinGecko/DeFiLlama/Dune API, systemd/uvicorn.
